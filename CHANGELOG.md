@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.1
 
 - Remove the Python implementation, its tests and its tools. Rust tests now
   hold the binary to what the last Python release did: the Python unit tests

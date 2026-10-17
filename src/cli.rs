@@ -15,7 +15,7 @@ use crate::title_watcher;
 use std::io::Write;
 use std::path::PathBuf;
 
-pub const VERSION: &str = "0.9.0";
+pub const VERSION: &str = "0.9.1";
 
 pub const USAGE: &str = "herdr-bar - jump to any Herdr tab, pane, or agent
 

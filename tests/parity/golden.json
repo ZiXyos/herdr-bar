@@ -10966,7 +10966,7 @@
    "{watcher}/title-watcher.stopped": ""
   },
   "stderr": "",
-  "stdout": "herdr-bar 0.9.0\n<masked>\n<masked>\nherdr bin        herdr\nsocket           <tmp>/herdr.sock\nsocket usable    yes\nconfig           <tmp>/config/config.json\nstate            <tmp>/state/recent.json\npreview          auto\nrefresh          900ms\nstdin is a tty   no\nherdr            0.7.5\nrows             10 (2 workspaces, 8 tabs, 6 agents)\n"
+  "stdout": "herdr-bar <version>\n<masked>\n<masked>\nherdr bin        herdr\nsocket           <tmp>/herdr.sock\nsocket usable    yes\nconfig           <tmp>/config/config.json\nstate            <tmp>/state/recent.json\npreview          auto\nrefresh          900ms\nstdin is a tty   no\nherdr            0.7.5\nrows             10 (2 workspaces, 8 tabs, 6 agents)\n"
  },
  "cli-doctor-unreachable": {
   "changes": [],
@@ -10975,7 +10975,7 @@
    "{watcher}/title-watcher.stopped": ""
   },
   "stderr": "",
-  "stdout": "herdr-bar 0.9.0\n<masked>\n<masked>\nherdr bin        herdr\nsocket           <tmp>/herdr.sock\nsocket usable    no, using the CLI\nconfig           <tmp>/config/config.json\nstate            <tmp>/state/recent.json\npreview          auto\nrefresh          900ms\nstdin is a tty   no\nherdr            unreachable: herdr binary not found (set HERDR_BIN_PATH)\n"
+  "stdout": "herdr-bar <version>\n<masked>\n<masked>\nherdr bin        herdr\nsocket           <tmp>/herdr.sock\nsocket usable    no, using the CLI\nconfig           <tmp>/config/config.json\nstate            <tmp>/state/recent.json\npreview          auto\nrefresh          900ms\nstdin is a tty   no\nherdr            unreachable: herdr binary not found (set HERDR_BIN_PATH)\n"
  },
  "cli-h": {
   "changes": [],
@@ -11056,7 +11056,7 @@
    "{watcher}/title-watcher.stopped": ""
   },
   "stderr": "",
-  "stdout": "herdr-bar 0.9.0\n"
+  "stdout": "herdr-bar <version>\n"
  },
  "watch-both": {
   "changes": [

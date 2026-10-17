@@ -135,6 +135,8 @@ fn run_cli(spec: &Value, scenario: &Value) -> Value {
     let tmp = machine.tmp.to_str().unwrap();
     stdout = stdout.replace(tmp, "<tmp>");
     stderr = stderr.replace(tmp, "<tmp>");
+    // A version bump must not need a new golden.
+    stdout = stdout.replace(concat!("herdr-bar ", env!("CARGO_PKG_VERSION"), "\n"), "herdr-bar <version>\n");
     dict(vec![
         ("exit", returncode(status)),
         ("stdout", Value::Str(stdout)),
