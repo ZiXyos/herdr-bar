@@ -80,9 +80,18 @@ pub fn unlock(file: &File) {
     }
 }
 
+/// Open a lock file or a log for appending, creating it if needed.
+///
+/// The handle can read too: a Windows lock needs read or write access, and
+/// Rust's append-only handle has neither (Python's "a" mode had write).
+pub fn open_append(path: &std::path::Path) -> io::Result<File> {
+    std::fs::OpenOptions::new().read(true).append(true).create(true).open(path)
+}
+
 #[cfg(windows)]
 pub fn lock(file: &File, blocking: bool) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, ERROR_LOCK_VIOLATION};
     use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY};
     use windows_sys::Win32::System::IO::OVERLAPPED;
     loop {
@@ -101,6 +110,12 @@ pub fn lock(file: &File, blocking: bool) -> io::Result<()> {
             return Ok(());
         }
         let error = io::Error::last_os_error();
+        // Held elsewhere, as std's File::try_lock reads it. Any other error
+        // is a failure to report, never a reason to wait.
+        let held = matches!(error.raw_os_error(), Some(code) if code == ERROR_LOCK_VIOLATION as i32 || code == ERROR_IO_PENDING as i32);
+        if !held {
+            return Err(error);
+        }
         if !blocking {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, error));
         }
@@ -429,11 +444,10 @@ pub fn process_age(pid: i128) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
-    use std::fs::OpenOptions;
     use std::time::{Duration, Instant};
 
     fn open(path: &std::path::Path) -> File {
-        OpenOptions::new().append(true).create(true).open(path).unwrap()
+        open_append(path).unwrap()
     }
 
     #[test]

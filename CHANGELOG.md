@@ -2,6 +2,9 @@
 
 ## 0.9.1
 
+- Fix tab titles and tab status on Windows, broken in 0.9.0: the lock files
+  were opened without the access a Windows lock needs, so the title watcher
+  never started and "Start tab watcher" never returned.
 - Remove the Python implementation, its tests and its tools. Rust tests now
   hold the binary to what the last Python release did: the Python unit tests
   are ported, about 19,000 recorded answers of the Python functions are

@@ -8,7 +8,7 @@ use crate::pyjson::Value;
 use crate::renaming_guard::{check_plugins, installed_plugins, AutomaticTabClient};
 use crate::tab_status::{Shared, TabStatus};
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -23,7 +23,7 @@ pub const LOCK_BY_NAME: &str = "-";
 pub const BINARY: &str = if cfg!(windows) { "herdr-bar.exe" } else { "herdr-bar" };
 
 fn open_append(path: &Path) -> std::result::Result<File, String> {
-    OpenOptions::new().append(true).create(true).open(path).map_err(|e| host::os_error_path(&e, path))
+    host::open_append(path).map_err(|e| host::os_error_path(&e, path))
 }
 
 fn mkdir(path: &Path) -> std::result::Result<(), String> {
@@ -265,7 +265,7 @@ fn finish_if_stopped(lock: &mut Option<File>, directory: &Path, tabs: Option<&mu
     if !stopped.exists() {
         return false;
     }
-    let Ok(gate) = OpenOptions::new().append(true).create(true).open(directory.join("title-launch.lock")) else {
+    let Ok(gate) = host::open_append(&directory.join("title-launch.lock")) else {
         return false;
     };
     if host::lock(&gate, true).is_err() {
