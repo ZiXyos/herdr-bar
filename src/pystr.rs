@@ -3,10 +3,10 @@
 //! The Python release measured, split, folded and compared text with CPython's
 //! own Unicode rules, and every one of those answers shows up somewhere a user
 //! can see it: in a column width, a highlight, a sort order. So the predicates
-//! here read tables generated from CPython itself (see
-//! `scripts/gen_unicode_tables.py`) rather than Rust's, which follow a
-//! different Unicode release and, for "space" and "digit", a different idea
-//! of what those words mean.
+//! here read tables generated once from CPython itself (see the header of
+//! `src/unicode_tables.rs`) rather than Rust's, which follow a different
+//! Unicode release and, for "space" and "digit", a different idea of what
+//! those words mean.
 //!
 //! Strings that Python indexes by code point are handled as `&[char]`.
 

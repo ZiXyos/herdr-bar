@@ -13,9 +13,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const INTERVAL: f64 = 2.0;
-const REGISTRATION_INTERVAL: f64 = 10.0;
-const MAX_BACKOFF: f64 = 30.0;
+// Unit tests run the watcher loop in-process; shorter periods keep them fast.
+const INTERVAL: f64 = if cfg!(test) { 0.1 } else { 2.0 };
+const REGISTRATION_INTERVAL: f64 = if cfg!(test) { 0.5 } else { 10.0 };
+const MAX_BACKOFF: f64 = if cfg!(test) { 0.4 } else { 30.0 };
 /// In place of an inherited descriptor: the worker claims the lock file by name.
 pub const LOCK_BY_NAME: &str = "-";
 
@@ -238,6 +239,10 @@ fn spawn(
                 });
             }
         }
+    }
+    #[cfg(test)]
+    if let Some(result) = tests::intercept_spawn(&process) {
+        return result;
     }
     process.spawn().map(|_| ()).map_err(|e| {
         let program = PathBuf::from(&command[0]);
@@ -592,6 +597,523 @@ pub fn watch(lock_fd: Option<i64>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{env_lock, EnvVars, TempDir};
+    use std::cell::RefCell;
+
+    /// One worker start that `spawn` was asked for: its arguments and cwd.
+    pub struct Spawned {
+        pub args: Vec<String>,
+        pub cwd: Option<PathBuf>,
+    }
+
+    struct Capture {
+        calls: Vec<Spawned>,
+        fail: bool,
+    }
+
+    thread_local! {
+        static CAPTURE: RefCell<Option<Capture>> = const { RefCell::new(None) };
+    }
+
+    /// The test seam in `spawn`: while `capture` runs on this thread, record
+    /// the worker instead of starting it (or fail as a spawn error would).
+    pub fn intercept_spawn(process: &Command) -> Option<std::result::Result<(), String>> {
+        CAPTURE.with(|capture| {
+            let mut capture = capture.borrow_mut();
+            let capture = capture.as_mut()?;
+            if capture.fail {
+                return Some(Err("spawn failed".to_string()));
+            }
+            capture.calls.push(Spawned {
+                args: process.get_args().map(|a| a.to_string_lossy().into_owned()).collect(),
+                cwd: process.get_current_dir().map(Path::to_path_buf),
+            });
+            Some(Ok(()))
+        })
+    }
+
+    /// Retry `attempt` until it succeeds, for up to two seconds. A child that
+    /// another test forks holds copies of this process's descriptors, locked
+    /// files included, until its exec closes them; a released lock can look
+    /// held for that moment.
+    fn soon<T>(mut attempt: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(found) = attempt() {
+                return Some(found);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The workers a start launches once the lock is free.
+    fn start_soon(resume: bool) -> Vec<Spawned> {
+        soon(|| Some(capture(false, || start(resume))).filter(|s| !s.is_empty())).unwrap_or_default()
+    }
+
+    fn capture(fail: bool, run: impl FnOnce()) -> Vec<Spawned> {
+        CAPTURE.with(|c| *c.borrow_mut() = Some(Capture { calls: Vec::new(), fail }));
+        run();
+        CAPTURE.with(|c| c.borrow_mut().take()).map(|c| c.calls).unwrap_or_default()
+    }
+
+    /// WatcherTest.setUp: state, config and socket env in a temp directory,
+    /// plus a plugin root of our own so nothing on the machine is touched.
+    struct Setup {
+        temp: TempDir,
+        #[cfg_attr(not(unix), allow(dead_code))]
+        root: PathBuf,
+        directory: PathBuf,
+        _vars: EnvVars,
+    }
+
+    impl Setup {
+        fn new(socket: Option<&Path>) -> Setup {
+            let temp = TempDir::new();
+            let base = temp.path().to_path_buf();
+            std::fs::write(base.join("config.json"), r#"{"agent_icons": "none", "auto_titles": true, "tab_status": true}"#)
+                .unwrap();
+            let root = base.join("root");
+            std::fs::create_dir_all(root.join("bin")).unwrap();
+            std::fs::write(root.join("herdr-plugin.toml"), "").unwrap();
+            std::fs::write(root.join("bin").join(BINARY), "binary").unwrap();
+            let socket = socket.map(Path::to_path_buf).unwrap_or_else(|| base.join("custom.sock"));
+            let mut vars = EnvVars::new();
+            vars.set("HERDR_PLUGIN_STATE_DIR", &base)
+                .set("HERDR_SOCKET_PATH", &socket)
+                .set("HERDR_AUTO_TITLE_TRANSCRIPT", "true")
+                .set("HERDR_PLUGIN_CONFIG_DIR", &base)
+                .set("HERDR_PLUGIN_ROOT", &root)
+                .set("HERDR_BIN_PATH", base.join("no-herdr"))
+                .set("HOME", &base)
+                .remove("CLAUDE_CONFIG_DIR");
+            let directory = title_state_dir().unwrap();
+            std::fs::create_dir_all(&directory).unwrap();
+            let root = std::fs::canonicalize(&root).unwrap();
+            Setup { temp, root, directory, _vars: vars }
+        }
+
+        fn config(&self, text: &str) {
+            std::fs::write(self.temp.path().join("config.json"), text).unwrap();
+        }
+
+        fn lock_file(&self) -> File {
+            open_append(&self.directory.join("title-watcher.lock")).unwrap()
+        }
+    }
+
+    #[test]
+    fn default_config_starts_a_watcher() {
+        let _env = env_lock();
+        let setup = Setup::new(None);
+        std::fs::remove_file(setup.temp.path().join("config.json")).unwrap();
+        assert_eq!(start_soon(false).len(), 1);
+    }
+
+    #[test]
+    fn explicit_title_opt_out_does_not_start_a_watcher() {
+        let _env = env_lock();
+        let setup = Setup::new(None);
+        setup.config(r#"{"auto_titles": false}"#);
+        assert_eq!(capture(false, || start(false)).len(), 0);
+    }
+
+    fn assert_repeated_start_does_not_spawn_another_watcher(setup: &Setup) {
+        {
+            let lock = setup.lock_file();
+            host::lock(&lock, true).unwrap();
+            assert_eq!(capture(false, || start(false)).len(), 0);
+        }
+        let spawns = start_soon(false);
+        assert_eq!(spawns.len(), 1);
+        // Outside the plugin directory, which Windows could not replace.
+        assert_eq!(spawns[0].cwd.as_deref(), Some(setup.directory.as_path()));
+        let token = spawns[0].args.last().unwrap();
+        assert_eq!(spawns[0].args[spawns[0].args.len() - 2], "--watch-titles");
+        if host::WINDOWS {
+            assert_eq!(token, LOCK_BY_NAME);
+        } else {
+            // The locked descriptor itself is handed to the worker.
+            assert!(token.parse::<i32>().unwrap() >= 0, "{}", token);
+        }
+    }
+
+    #[test]
+    fn repeated_start_does_not_spawn_another_watcher() {
+        let _env = env_lock();
+        let setup = Setup::new(None);
+        assert_repeated_start_does_not_spawn_another_watcher(&setup);
+    }
+
+    #[test]
+    fn unwritable_state_or_spawn_failure_does_not_break_popup() {
+        let _env = env_lock();
+        let setup = Setup::new(None);
+        {
+            // State under a regular file: every mkdir fails.
+            let blocker = setup.temp.path().join("blocker");
+            std::fs::write(&blocker, "").unwrap();
+            let mut vars = EnvVars::new();
+            vars.set("HERDR_PLUGIN_STATE_DIR", blocker.join("state"));
+            assert_eq!(capture(false, || start(false)).len(), 0);
+        }
+        assert_eq!(capture(true, || start(false)).len(), 0);
+        // Failed spawn must release the singleton lock.
+        assert_repeated_start_does_not_spawn_another_watcher(&setup);
+    }
+
+    #[test]
+    fn stop_prevents_event_restarts_and_explicit_resume_clears_it() {
+        let _env = env_lock();
+        let _setup = Setup::new(None);
+        stop().unwrap();
+        assert_eq!(capture(false, || start(false)).len(), 0);
+        assert_eq!(start_soon(true).len(), 1);
+    }
+
+    #[test]
+    fn stop_resume_interleavings_do_not_lose_the_watcher() {
+        let _env = env_lock();
+        let setup = Setup::new(None);
+        let file = setup.lock_file();
+        host::lock(&file, true).unwrap();
+        let mut lock = Some(file);
+        stop().unwrap();
+        let spawns = capture(false, || {
+            start(true);
+            assert!(!finish_if_stopped(&mut lock, &setup.directory, None));
+        });
+        assert_eq!(spawns.len(), 0);
+        assert!(lock.is_some());
+        stop().unwrap();
+        assert!(finish_if_stopped(&mut lock, &setup.directory, None));
+        assert!(lock.is_none());
+        assert_eq!(start_soon(true).len(), 1);
+    }
+
+    #[test]
+    fn server_scoped_state_separates_named_sessions() {
+        let _env = env_lock();
+        let setup = Setup::new(None);
+        let mut vars = EnvVars::new();
+        vars.set("HERDR_SOCKET_PATH", "/other/session.sock");
+        assert_ne!(title_state_dir().unwrap(), setup.directory);
+    }
+
+    #[test]
+    fn windows_handoff_releases_the_lock_for_a_worker_that_claims_it() {
+        // The claim half of the by-name handoff; `replace` itself execs on POSIX.
+        let _env = env_lock();
+        let setup = Setup::new(None);
+        let lock = claim(&setup.directory).unwrap();
+        assert!(lock.is_some());
+        assert!(claim(&setup.directory).unwrap().is_none());
+        drop(lock);
+        assert!(soon(|| claim(&setup.directory).unwrap()).is_some());
+    }
+
+    #[cfg(unix)]
+    mod with_server {
+        use super::*;
+        use crate::pyjson;
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::io::IntoRawFd;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::sync::{Arc, Mutex};
+
+        type Responder = dyn Fn(&Value) -> Option<Value> + Send + Sync;
+
+        /// A stand-in for the Herdr socket: one request per connection.
+        /// A responder answering None drops the connection unanswered.
+        struct FakeHerdr {
+            path: PathBuf,
+            requests: Arc<Mutex<Vec<Value>>>,
+            stop: Arc<AtomicBool>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl FakeHerdr {
+            fn new(path: &Path, responder: Arc<Responder>) -> FakeHerdr {
+                let listener = UnixListener::bind(path).unwrap();
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let stop = Arc::new(AtomicBool::new(false));
+                let (seen, done) = (requests.clone(), stop.clone());
+                let thread = std::thread::spawn(move || {
+                    for conn in listener.incoming() {
+                        if done.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let Ok(mut conn) = conn else { continue };
+                        let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut line = String::new();
+                        if BufReader::new(&conn).read_line(&mut line).is_err() {
+                            continue;
+                        }
+                        let Ok(request) = pyjson::loads(&line) else { continue };
+                        seen.lock().unwrap().push(request.clone());
+                        if let Some(reply) = responder(&request) {
+                            let _ = conn.write_all((pyjson::dumps(&reply, false) + "\n").as_bytes());
+                        }
+                    }
+                });
+                FakeHerdr { path: path.to_path_buf(), requests, stop, thread: Some(thread) }
+            }
+
+            fn methods(&self) -> Vec<String> {
+                self.requests.lock().unwrap().iter().map(|r| r.get("method").as_str().unwrap_or("").to_string()).collect()
+            }
+
+            fn renames(&self) -> Vec<String> {
+                let requests = self.requests.lock().unwrap();
+                requests
+                    .iter()
+                    .filter(|r| r.get("method").as_str() == Some("tab.rename"))
+                    .map(|r| r.get("params").get("label").as_str().unwrap_or("").to_string())
+                    .collect()
+            }
+        }
+
+        impl Drop for FakeHerdr {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::SeqCst);
+                let _ = UnixStream::connect(&self.path);
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+
+        fn ok(result: Value) -> Option<Value> {
+            let mut map = pyjson::Map::new();
+            map.insert("result", result);
+            Some(Value::Dict(map))
+        }
+
+        fn json(text: &str) -> Value {
+            pyjson::loads(text).unwrap()
+        }
+
+        fn plugins(root: &Path, enabled: bool, extra: &str) -> Value {
+            let root = pyjson::dumps(&Value::str(root.to_string_lossy()), false);
+            json(&format!(
+                r#"{{"plugins": [{{"plugin_id": "herdr-bar", "enabled": {}, "plugin_root": {}}}{}]}}"#,
+                if enabled { "true" } else { "false" },
+                root,
+                extra
+            ))
+        }
+
+        /// test_auto_title.snapshot(): one tab labelled "1" with one agent.
+        fn snapshot() -> Value {
+            json(
+                r#"{"tabs": [{"tab_id": "w1:t9", "workspace_id": "w1", "number": 9, "label": "1"}],
+                "panes": [{"pane_id": "w1:p9", "tab_id": "w1:t9", "terminal_id": "term9"}],
+                "agents": [{"pane_id": "w1:p9", "tab_id": "w1:t9", "agent": "claude", "cwd": "/work/app",
+                "agent_session": {"agent": "claude", "kind": "id", "value": "12345678-1234-1234-1234-123456789abc"}}]}"#,
+            )
+        }
+
+        /// A Herdr that serves `data` (renames update it) and lists `plugin_list`.
+        fn herdr(path: &Path, data: Arc<Mutex<Value>>, plugin_list: Value, fail: Arc<AtomicBool>) -> FakeHerdr {
+            FakeHerdr::new(
+                path,
+                Arc::new(move |request: &Value| {
+                    if fail.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                    match request.get("method").as_str().unwrap_or("") {
+                        "plugin.list" => ok(plugin_list.clone()),
+                        "session.snapshot" => {
+                            let mut map = pyjson::Map::new();
+                            map.insert("snapshot", data.lock().unwrap().clone());
+                            ok(Value::Dict(map))
+                        }
+                        "tab.rename" => {
+                            let label = request.get("params").get("label").clone();
+                            let mut data = data.lock().unwrap();
+                            if let Some(Value::List(tabs)) = data.as_dict_mut().unwrap().get_mut("tabs") {
+                                tabs[0].as_dict_mut().unwrap().insert("label", label);
+                            }
+                            ok(Value::Dict(pyjson::Map::new()))
+                        }
+                        _ => Some(json(r#"{"error": {"message": "unsupported"}}"#)),
+                    }
+                }),
+            )
+        }
+
+        fn label(data: &Arc<Mutex<Value>>) -> String {
+            data.lock().unwrap().get("tabs").list_or_empty()[0].get("label").as_str().unwrap_or("").to_string()
+        }
+
+        /// A descriptor for a locked handle, as `--watch-titles N` receives.
+        fn lock_fd(setup: &Setup) -> i64 {
+            let file = setup.lock_file();
+            host::lock(&file, false).unwrap();
+            file.into_raw_fd() as i64
+        }
+
+        /// Run `watch` on its own thread; a stop marker ends it if the test fails.
+        fn watch_in_background(fd: i64) -> (mpsc::Receiver<i32>, StopOnDrop) {
+            let (send, receive) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = send.send(watch(Some(fd)));
+            });
+            (receive, StopOnDrop)
+        }
+
+        struct StopOnDrop;
+
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    let _ = stop();
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
+        }
+
+        fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out waiting for {}", what);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        #[test]
+        fn registration_uses_api_instead_of_socket_directory() {
+            let _env = env_lock();
+            let socket = crate::testutil::socket_path();
+            let setup = Setup::new(Some(&socket));
+            let reply = Arc::new(Mutex::new(plugins(&setup.root, true, "")));
+            let shared = reply.clone();
+            let _server = FakeHerdr::new(&socket, Arc::new(move |_: &Value| ok(shared.lock().unwrap().clone())));
+            let mut client = HerdrClient::new(None, 2.0, true);
+            assert_eq!(registered_root(&mut client).unwrap(), Some(setup.root.clone()));
+            *reply.lock().unwrap() = plugins(&setup.root, false, "");
+            assert_eq!(registered_root(&mut client).unwrap(), None);
+            *reply.lock().unwrap() = json(r#"{"plugins": []}"#);
+            assert_eq!(registered_root(&mut client).unwrap(), None);
+            *reply.lock().unwrap() = json("{}");
+            let error = registered_root(&mut client).unwrap_err();
+            assert_eq!(error.kind, Kind::Herdr);
+        }
+
+        #[test]
+        fn enabled_naming_plugin_prevents_all_tab_operations() {
+            let _env = env_lock();
+            let socket = crate::testutil::socket_path();
+            let setup = Setup::new(Some(&socket));
+            let list = plugins(&setup.root, true, r#", {"plugin_id": "herdr.auto-title", "enabled": true}"#);
+            let server = herdr(&socket, Arc::new(Mutex::new(snapshot())), list, Arc::new(AtomicBool::new(false)));
+            let mut client = HerdrClient::new(None, 2.0, true);
+            assert_eq!(registered_root(&mut client).unwrap_err().kind, Kind::Renaming);
+            assert_eq!(watch(Some(lock_fd(&setup))), 0);
+            let methods = server.methods();
+            assert!(!methods.iter().any(|m| m == "session.snapshot" || m == "tab.rename"), "{:?}", methods);
+        }
+
+        #[test]
+        fn disabled_plugin_exits_before_any_tab_operations() {
+            let _env = env_lock();
+            let socket = crate::testutil::socket_path();
+            let setup = Setup::new(Some(&socket));
+            let list = plugins(&setup.root, false, "");
+            let server = herdr(&socket, Arc::new(Mutex::new(snapshot())), list, Arc::new(AtomicBool::new(false)));
+            assert_eq!(watch(Some(lock_fd(&setup))), 0);
+            let methods = server.methods();
+            assert!(methods.iter().any(|m| m == "plugin.list"), "{:?}", methods);
+            assert!(!methods.iter().any(|m| m == "session.snapshot" || m == "tab.rename"), "{:?}", methods);
+        }
+
+        #[test]
+        fn socket_only_reconnects_and_never_falls_back_to_cli() {
+            let _env = env_lock();
+            let socket = crate::testutil::socket_path();
+            let setup = Setup::new(Some(&socket));
+            // A herdr CLI that leaves a mark if anything runs it.
+            let marker = setup.temp.path().join("cli-ran");
+            let cli = setup.temp.path().join("herdr");
+            std::fs::write(&cli, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut vars = EnvVars::new();
+            vars.set("HERDR_BIN_PATH", &cli);
+            let mut client = HerdrClient::new(None, 2.0, true);
+            // Server stopped: an error, not a CLI call.
+            assert!(client.snapshot().is_err());
+            let data = Arc::new(Mutex::new(json(r#"{"tabs": []}"#)));
+            let server = herdr(&socket, data, json(r#"{"plugins": []}"#), Arc::new(AtomicBool::new(false)));
+            let snapshot = client.snapshot().unwrap();
+            assert!(pyjson::py_eq(&snapshot, &json(r#"{"tabs": []}"#)));
+            assert_eq!(server.methods(), vec!["session.snapshot".to_string()]);
+            assert!(!marker.exists(), "the CLI ran");
+        }
+
+        #[test]
+        fn disabling_both_features_restores_owned_prefix_and_exits() {
+            let _env = env_lock();
+            let socket = crate::testutil::socket_path();
+            let setup = Setup::new(Some(&socket));
+            setup.config(r#"{"auto_titles": false, "tab_status": true, "agent_icons": "none"}"#);
+            let data = Arc::new(Mutex::new(snapshot()));
+            let list = plugins(&setup.root, true, "");
+            let server = herdr(&socket, data.clone(), list, Arc::new(AtomicBool::new(false)));
+            let (result, _guard) = watch_in_background(lock_fd(&setup));
+            wait_for("the status prefix", || label(&data) == "○ 1");
+            setup.config(r#"{"auto_titles": false, "tab_status": false, "agent_icons": "none"}"#);
+            let code = result.recv_timeout(Duration::from_secs(5)).expect("watcher did not exit after both features were disabled");
+            assert_eq!(code, 0);
+            assert_eq!(server.renames(), vec!["○ 1".to_string(), "1".to_string()]);
+        }
+
+        #[test]
+        fn watcher_recovers_after_server_restart_without_opening_popup() {
+            let _env = env_lock();
+            let socket = crate::testutil::socket_path();
+            let setup = Setup::new(Some(&socket));
+            let mut data = snapshot();
+            {
+                let agents = data.as_dict_mut().unwrap().get_mut("agents").unwrap();
+                let Value::List(agents) = agents else { unreachable!() };
+                let agent = agents[0].as_dict_mut().unwrap();
+                agent.insert("agent", Value::str("codex"));
+                agent.insert("terminal_title_stripped", Value::str("First title | app"));
+                agent.get_mut("agent_session").unwrap().as_dict_mut().unwrap().insert("agent", Value::str("codex"));
+            }
+            let data = Arc::new(Mutex::new(data));
+            let fail = Arc::new(AtomicBool::new(false));
+            let server = herdr(&socket, data.clone(), plugins(&setup.root, true, ""), fail.clone());
+            let (result, _guard) = watch_in_background(lock_fd(&setup));
+            wait_for("the first title", || label(&data) == "○ First title");
+            // The server goes away for a few backoff rounds...
+            fail.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(800));
+            {
+                let mut data = data.lock().unwrap();
+                let Some(Value::List(agents)) = data.as_dict_mut().unwrap().get_mut("agents") else { unreachable!() };
+                agents[0].as_dict_mut().unwrap().insert("terminal_title_stripped", Value::str("After restart | app"));
+            }
+            // ...and comes back with the agent's title changed.
+            fail.store(false, Ordering::SeqCst);
+            wait_for("the title after restart", || label(&data) == "○ After restart");
+            stop().unwrap();
+            let code = result.recv_timeout(Duration::from_secs(5)).expect("watcher did not stop");
+            assert_eq!(code, 0);
+            // Status-led while watched, bare again once stopped.
+            assert_eq!(
+                server.renames(),
+                vec!["○ First title".to_string(), "○ After restart".to_string(), "After restart".to_string()]
+            );
+        }
+    }
 
     #[test]
     fn staged_binary_is_reused_and_replaced() {

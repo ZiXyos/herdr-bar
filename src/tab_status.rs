@@ -503,7 +503,7 @@ impl TabStatus {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -515,5 +515,737 @@ mod tests {
         assert_eq!(strip(&format!("{}   name", logo)), format!("{}   name", logo));
         assert_eq!(strip("  name"), "name");
         assert_eq!(strip("name"), "name");
+    }
+
+    // -- ported from tests/test_tab_status.py ----------------------------------
+
+    fn claude() -> char {
+        icons::logo_for(Some("claude")).unwrap()
+    }
+
+    #[test]
+    fn every_label_strips_back_to_the_name() {
+        for logo in [None, Some(claude())] {
+            for status in ["blocked", "working", "done", "idle", "unknown", "odd"] {
+                let label = compose("Fix login", status, logo);
+                assert_eq!(strip(&label), "Fix login", "{}", label);
+            }
+        }
+    }
+
+    #[test]
+    fn glyphs_are_static() {
+        assert_eq!(compose("x", "blocked", Some(claude())), format!("{}  ◉ x", claude()));
+        assert_eq!(compose("x", "working", None), "◐ x");
+        assert_eq!(compose("x", "idle", None), "✓ x");
+    }
+
+    #[test]
+    fn labels_from_the_animated_release_still_strip() {
+        let logo = claude();
+        for label in [
+            "⠋ Fix login".to_string(),
+            "⠏ Fix login".to_string(),
+            "  Fix login".to_string(),
+            format!("{}  ⠹ Fix login", logo),
+            format!("{}    Fix login", logo),
+        ] {
+            assert_eq!(strip(&label), "Fix login", "{}", label);
+        }
+    }
+
+    #[test]
+    fn plain_names_are_left_alone() {
+        for label in ["Fix login", "●", "◉notes", " lead", ""] {
+            assert_eq!(strip(label), label);
+        }
+    }
+
+    pub(crate) fn session(status: &str, label: &str) -> Value {
+        let mut data = pyjson::loads(
+            r#"{"focused_workspace_id": "w1", "focused_tab_id": "w1:t1",
+                "tabs": [{"tab_id": "w1:t1", "workspace_id": "w1", "label": "1"},
+                         {"tab_id": "w1:t2", "workspace_id": "w1", "label": ""}],
+                "panes": [{"pane_id": "w1:p2", "tab_id": "w1:t2", "terminal_id": "term2"}],
+                "agents": [{"pane_id": "w1:p2", "tab_id": "w1:t2", "agent": "claude",
+                            "agent_status": "", "cwd": "/work/app"}]}"#,
+        )
+        .unwrap();
+        set(&mut list(&mut data, "tabs")[1], "label", Value::str(label));
+        set(&mut list(&mut data, "agents")[0], "agent_status", Value::str(status));
+        data
+    }
+
+    pub(crate) fn list<'a>(data: &'a mut Value, key: &str) -> &'a mut Vec<Value> {
+        match data.as_dict_mut().unwrap().get_mut(key) {
+            Some(Value::List(items)) => items,
+            _ => panic!("no list at {}", key),
+        }
+    }
+
+    pub(crate) fn set(item: &mut Value, key: &str, value: Value) {
+        item.as_dict_mut().unwrap().insert(key, value);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn config(json: &str) -> Config {
+        Config::from_values(pyjson::loads(json).unwrap().as_dict().unwrap())
+    }
+
+    #[test]
+    fn bar_rows_show_the_bare_tab_name() {
+        let mut data = session("working", "◐ Fix login");
+        set(&mut list(&mut data, "tabs")[0], "label", Value::str("◐ my plain tab"));
+        let items = crate::items::build_items(&data);
+        let title = |key: &str| items.iter().find(|item| item.key == key).unwrap().title.clone();
+        assert_eq!(title("w1:p2"), "Fix login");
+        assert_eq!(title("w1:t1"), "◐ my plain tab");
+    }
+
+    #[test]
+    fn without_a_stream_wait_just_sleeps() {
+        let mut stream = crate::client::EventStream::new(None, 1.0);
+        stream.follow(&[dict(vec![("type", Value::str("tab.focused"))])]).unwrap();
+        let started = Instant::now();
+        assert!(!stream.wait(0.05));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[cfg(unix)]
+    pub(crate) use fake::*;
+
+    /// A Herdr socket that answers snapshots, renames and plugin lists, and
+    /// applies renames to its data as the real server does.
+    #[cfg(unix)]
+    mod fake {
+        use super::*;
+        use crate::client::HerdrClient;
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex, MutexGuard};
+
+        pub struct State {
+            pub data: Value,
+            pub renames: Vec<(String, String)>,
+            pub fail_rename: bool,
+            /// The whole `plugin.list` response.
+            pub plugin_reply: Value,
+            /// A file read at every rename, before it is applied.
+            pub peek: Option<PathBuf>,
+            pub peeked: Vec<String>,
+        }
+
+        pub struct FakeHerdr {
+            pub path: PathBuf,
+            state: Arc<Mutex<State>>,
+            stop: Arc<AtomicBool>,
+        }
+
+        impl FakeHerdr {
+            pub fn new(data: Value) -> FakeHerdr {
+                let path = crate::testutil::socket_path();
+                let listener = UnixListener::bind(&path).unwrap();
+                let state = Arc::new(Mutex::new(State {
+                    data,
+                    renames: Vec::new(),
+                    fail_rename: false,
+                    plugin_reply: pyjson::loads(r#"{"result": {"plugins": []}}"#).unwrap(),
+                    peek: None,
+                    peeked: Vec::new(),
+                }));
+                let stop = Arc::new(AtomicBool::new(false));
+                let (shared, stopped) = (state.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    for conn in listener.incoming() {
+                        if stopped.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let Ok(mut conn) = conn else { continue };
+                        let mut line = String::new();
+                        if BufReader::new(&conn).read_line(&mut line).is_err() {
+                            continue;
+                        }
+                        let Ok(request) = pyjson::loads(&line) else { continue };
+                        let reply = FakeHerdr::answer(&mut shared.lock().unwrap(), &request);
+                        let _ = conn.write_all(format!("{}\n", pyjson::dumps(&reply, false)).as_bytes());
+                    }
+                });
+                FakeHerdr { path, state, stop }
+            }
+
+            fn answer(state: &mut State, request: &Value) -> Value {
+                let params = request.get("params");
+                match request.get("method").as_str().unwrap_or("") {
+                    "session.snapshot" => dict(vec![("result", dict(vec![("snapshot", state.data.clone())]))]),
+                    "plugin.list" => state.plugin_reply.clone(),
+                    "tab.rename" => {
+                        if state.fail_rename {
+                            return pyjson::loads(r#"{"error": {"message": "rename refused"}}"#).unwrap();
+                        }
+                        if let Some(peek) = &state.peek {
+                            let text = std::fs::read_to_string(peek).unwrap_or_default();
+                            state.peeked.push(text);
+                        }
+                        let tab_id = params.get("tab_id").as_str().unwrap().to_string();
+                        let label = params.get("label").as_str().unwrap().to_string();
+                        for tab in list(&mut state.data, "tabs") {
+                            if tab.get("tab_id").as_str() == Some(tab_id.as_str()) {
+                                set(tab, "label", Value::str(label.clone()));
+                            }
+                        }
+                        state.renames.push((tab_id, label));
+                        dict(vec![("result", Value::Dict(Map::new()))])
+                    }
+                    _ => pyjson::loads(r#"{"error": {"message": "unknown method"}}"#).unwrap(),
+                }
+            }
+
+            pub fn state(&self) -> MutexGuard<'_, State> {
+                self.state.lock().unwrap()
+            }
+
+            pub fn renames(&self) -> Vec<(String, String)> {
+                self.state().renames.clone()
+            }
+
+            pub fn label(&self, tab_id: &str) -> String {
+                let state = self.state();
+                let tab = state.data.get("tabs").list_or_empty().iter().find(|t| t.get("tab_id").as_str() == Some(tab_id)).cloned();
+                tab.unwrap().get("label").as_str().unwrap().to_string()
+            }
+
+            pub fn client(&self) -> HerdrClient {
+                HerdrClient::new(Some(self.path.to_string_lossy().into_owned()), 2.0, true)
+            }
+
+            pub fn writer(&self) -> AutomaticTabClient {
+                AutomaticTabClient::new(self.client())
+            }
+        }
+
+        impl Drop for FakeHerdr {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::SeqCst);
+                let _ = std::os::unix::net::UnixStream::connect(&self.path);
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+
+        pub fn pair(t1: &str, t2: &str) -> Vec<(String, String)> {
+            vec![(t1.to_string(), t2.to_string())]
+        }
+
+        /// The environment every client-side test runs in: no user config.
+        pub fn quiet_env() -> crate::testutil::EnvVars {
+            let mut env = crate::testutil::EnvVars::new();
+            env.remove("HERDR_PLUGIN_CONFIG_DIR").remove("HERDR_SOCKET_PATH");
+            env
+        }
+    }
+
+    #[cfg(unix)]
+    mod with_server {
+        use super::*;
+        use crate::testutil::{env_lock, TempDir};
+
+        fn make(server: &FakeHerdr, dir: &TempDir, extra: &str) -> TabStatus {
+            let mut tabs = TabStatus::new(server.writer(), Some(dir.path().to_path_buf()));
+            let extra = if extra.is_empty() { String::new() } else { format!(", {}", extra) };
+            tabs.configure(&config(&format!(r#"{{"agent_icons": "none", "tab_status": true{}}}"#, extra)));
+            tabs
+        }
+
+        fn restart(server: &FakeHerdr, dir: &TempDir) -> TabStatus {
+            let mut tabs = TabStatus::new(server.writer(), Some(dir.path().to_path_buf()));
+            tabs.configure(&config(r#"{"tab_status": true, "agent_icons": "none"}"#));
+            tabs
+        }
+
+        fn tick(tabs: &mut TabStatus) {
+            let snapshot = tabs.snapshot().unwrap();
+            tabs.apply(&snapshot);
+        }
+
+        fn edit(server: &FakeHerdr, change: impl FnOnce(&mut Value)) {
+            change(&mut server.state().data);
+        }
+
+        fn saved(dir: &TempDir) -> Value {
+            pyjson::loads(&std::fs::read_to_string(dir.path().join("tab-status.json")).unwrap()).unwrap()
+        }
+
+        #[test]
+        fn agent_tab_gets_status_and_logo_others_are_untouched() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let (server, dir) = (FakeHerdr::new(session("working", "2")), TempDir::new());
+            let mut tabs = make(&server, &dir, r#""agent_icons": "font""#);
+            tick(&mut tabs);
+            assert_eq!(server.renames(), pair("w1:t2", &format!("{}  ◐ 2", claude())));
+            tick(&mut tabs);
+            assert_eq!(server.renames().len(), 1, "an unchanged tab is not renamed again");
+        }
+
+        #[test]
+        fn status_changes_rewrite_only_the_prefix() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let (server, dir) = (FakeHerdr::new(session("working", "Fix login")), TempDir::new());
+            let mut tabs = make(&server, &dir, "");
+            tick(&mut tabs);
+            edit(&server, |d| set(&mut list(d, "agents")[0], "agent_status", Value::str("done")));
+            tick(&mut tabs);
+            assert_eq!(server.label("w1:t2"), "● Fix login");
+        }
+
+        #[test]
+        fn record_is_written_before_the_decorated_label() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let (server, dir) = (FakeHerdr::new(session("working", "2")), TempDir::new());
+            server.state().peek = Some(dir.path().join("tab-status.json"));
+            let mut tabs = make(&server, &dir, "");
+            tick(&mut tabs);
+            let peeked = server.state().peeked.clone();
+            assert!(!peeked.is_empty());
+            let first = pyjson::loads(&peeked[0]).expect("record saved before the rename");
+            assert!(first.as_dict().unwrap().contains_key("w1:t2"));
+        }
+
+        #[test]
+        fn unwritable_state_never_leaves_an_unremovable_prefix() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let (server, dir) = (FakeHerdr::new(session("working", "2")), TempDir::new());
+            // Writes into a directory that does not exist always fail.
+            let mut tabs = TabStatus::new(server.writer(), Some(dir.path().join("missing")));
+            tabs.configure(&config(r#"{"agent_icons": "none", "tab_status": true}"#));
+            tick(&mut tabs);
+            assert_eq!(server.renames(), vec![]);
+            assert_eq!(server.label("w1:t2"), "2");
+        }
+
+        #[test]
+        fn unnamed_tab_keeps_following_its_position() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let (server, dir) = (FakeHerdr::new(session("working", "2")), TempDir::new());
+            let mut tabs = make(&server, &dir, "");
+            tick(&mut tabs);
+            edit(&server, |d| {
+                list(d, "tabs").remove(0); // the first tab closes; herdr would say "1" now
+            });
+            tick(&mut tabs);
+            assert_eq!(server.label("w1:t2"), "◐ 1");
+            edit(&server, |d| list(d, "agents").clear());
+            tick(&mut tabs);
+            assert_eq!(server.label("w1:t2"), "1");
+            edit(&server, |d| {
+                let tab = pyjson::loads(r#"{"tab_id": "w1:t0", "workspace_id": "w1", "label": "1"}"#).unwrap();
+                list(d, "tabs").insert(0, tab);
+            });
+            tick(&mut tabs);
+            assert_eq!(server.label("w1:t2"), "2", "still numbered like an unnamed tab");
+        }
+
+        #[test]
+        fn external_rename_yields_across_status_changes_and_restart() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let (server, dir) = (FakeHerdr::new(session("working", "2")), TempDir::new());
+            let mut tabs = make(&server, &dir, "");
+            tick(&mut tabs);
+            edit(&server, |d| set(&mut list(d, "tabs")[1], "label", Value::str("Release notes")));
+            for status in ["working", "done", "idle"] {
+                edit(&server, |d| set(&mut list(d, "agents")[0], "agent_status", Value::str(status)));
+                tick(&mut tabs);
+            }
+            let mut restarted = restart(&server, &dir);
+            tick(&mut restarted);
+            restarted.clear();
+            assert_eq!(server.label("w1:t2"), "Release notes");
+            assert_eq!(server.renames(), pair("w1:t2", "◐ 2"));
+        }
+
+        #[test]
+        fn competing_plugin_restoring_original_name_does_not_loop() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let (server, dir) = (FakeHerdr::new(session("working", "Fix login")), TempDir::new());
+            let mut tabs = make(&server, &dir, "");
+            tick(&mut tabs);
+            assert!(!saved(&dir).get("w1:t2").as_dict().unwrap().contains_key("previous"));
+            let mut tabs = restart(&server, &dir);
+            for _ in 0..5 {
+                edit(&server, |d| set(&mut list(d, "tabs")[1], "label", Value::str("Fix login")));
+                tick(&mut tabs);
+            }
+            assert_eq!(server.renames(), pair("w1:t2", "◐ Fix login"));
+            assert_eq!(server.label("w1:t2"), "Fix login");
+        }
+
+        #[test]
+        fn disable_and_stop_do_not_strip_another_writers_glyph() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            for cleanup in ["disable", "stop"] {
+                let (server, dir) = (FakeHerdr::new(session("working", "Fix login")), TempDir::new());
+                let mut tabs = make(&server, &dir, "");
+                tick(&mut tabs);
+                edit(&server, |d| set(&mut list(d, "tabs")[1], "label", Value::str("✓ Other plugin")));
+                if cleanup == "disable" {
+                    tabs.configure(&config(r#"{"tab_status": false}"#));
+                    tick(&mut tabs);
+                } else {
+                    tabs.clear();
+                }
+                assert_eq!(server.label("w1:t2"), "✓ Other plugin", "{}", cleanup);
+                assert!(server.renames().len() <= 1, "{}", cleanup);
+            }
+        }
+
+        #[test]
+        fn external_rename_between_snapshot_and_write_is_respected() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let (server, dir) = (FakeHerdr::new(session("working", "Fix login")), TempDir::new());
+            let mut tabs = make(&server, &dir, "");
+            let snapshot = tabs.snapshot().unwrap();
+            edit(&server, |d| set(&mut list(d, "tabs")[1], "label", Value::str("Other plugin")));
+            tabs.apply(&snapshot);
+            tick(&mut tabs);
+            assert_eq!(server.label("w1:t2"), "Other plugin");
+            assert_eq!(server.renames(), vec![]);
+        }
+
+        #[test]
+        fn glyph_led_names_on_unrecorded_tabs_are_not_stripped() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let mut data = session("idle", "● pinned");
+            set(&mut list(&mut data, "tabs")[0], "label", Value::str("✓ notes"));
+            let (server, dir) = (FakeHerdr::new(data), TempDir::new());
+            let mut tabs = make(&server, &dir, "");
+            tick(&mut tabs);
+            assert_eq!(server.label("w1:t1"), "✓ notes");
+            assert_eq!(server.label("w1:t2"), "✓ ● pinned");
+        }
+
+        #[test]
+        fn most_urgent_agent_leads_a_shared_tab() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let mut data = session("working", "Pair");
+            let codex = pyjson::loads(r#"{"pane_id": "w1:p3", "tab_id": "w1:t2", "agent": "codex", "agent_status": "blocked"}"#).unwrap();
+            list(&mut data, "agents").push(codex);
+            let (server, dir) = (FakeHerdr::new(data), TempDir::new());
+            let mut tabs = make(&server, &dir, r#""agent_icons": "font""#);
+            tick(&mut tabs);
+            assert_eq!(server.label("w1:t2"), format!("{}  ◉ Pair", icons::logo_for(Some("codex")).unwrap()));
+        }
+
+        #[test]
+        fn labels_change_only_with_status() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let (server, dir) = (FakeHerdr::new(session("blocked", "Fix")), TempDir::new());
+            let mut tabs = make(&server, &dir, "");
+            tick(&mut tabs);
+            assert_eq!(server.label("w1:t2"), "◉ Fix");
+            for focus in ["w1:t2", "w1:t1", "w2:t1"] {
+                edit(&server, |d| {
+                    set(d, "focused_tab_id", Value::str(focus));
+                    set(d, "focused_workspace_id", Value::str(focus.split(':').next().unwrap()));
+                });
+                tick(&mut tabs);
+            }
+            assert_eq!(server.renames().len(), 1, "focus and time never rename a tab");
+            edit(&server, |d| set(&mut list(d, "agents")[0], "agent_status", Value::str("working")));
+            tick(&mut tabs);
+            tick(&mut tabs);
+            assert_eq!(server.renames()[1..].to_vec(), pair("w1:t2", "◐ Fix"));
+        }
+
+        #[test]
+        fn an_animated_label_settles_in_one_rename() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let (server, dir) = (FakeHerdr::new(session("working", "Fix")), TempDir::new());
+            let mut tabs = make(&server, &dir, "");
+            let records = pyjson::loads(r#"{"w1:t2": {"base": "Fix", "default": false}}"#).unwrap();
+            tabs.save(records.as_dict().unwrap().clone()).unwrap();
+            // left behind by the animated release
+            edit(&server, |d| set(&mut list(d, "tabs")[1], "label", Value::str("⠸ Fix")));
+            tick(&mut tabs);
+            tick(&mut tabs);
+            assert_eq!(server.renames(), pair("w1:t2", "◐ Fix"));
+        }
+
+        #[test]
+        fn disabling_and_clearing_restore_bare_names() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let (server, dir) = (FakeHerdr::new(session("working", "Fix")), TempDir::new());
+            let mut tabs = make(&server, &dir, "");
+            tick(&mut tabs);
+            tabs.configure(&config(r#"{"tab_status": false}"#));
+            tick(&mut tabs);
+            assert_eq!(server.label("w1:t2"), "Fix");
+            tabs.configure(&config(r#"{"tab_status": true}"#));
+            tick(&mut tabs);
+            tabs.clear();
+            assert_eq!(server.label("w1:t2"), "Fix");
+            assert!(TabStatus::new(server.writer(), Some(dir.path().to_path_buf())).records.is_empty());
+        }
+
+        #[test]
+        fn records_survive_a_restart() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let (server, dir) = (FakeHerdr::new(session("working", "Fix")), TempDir::new());
+            let mut tabs = make(&server, &dir, "");
+            tick(&mut tabs);
+            edit(&server, |d| set(&mut list(d, "agents")[0], "agent_status", Value::str("idle")));
+            let mut restarted = make(&server, &dir, "");
+            tick(&mut restarted);
+            assert_eq!(server.label("w1:t2"), "✓ Fix", "no second prefix after a restart");
+        }
+
+        #[test]
+        fn failed_rename_is_retried_later() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let (server, dir) = (FakeHerdr::new(session("working", "Fix")), TempDir::new());
+            let mut tabs = make(&server, &dir, "");
+            server.state().fail_rename = true;
+            tick(&mut tabs);
+            server.state().fail_rename = false;
+            tick(&mut tabs);
+            assert_eq!(server.label("w1:t2"), "◐ Fix");
+        }
+
+        #[test]
+        fn failed_rename_preserves_glyph_led_name_after_restart() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let (server, dir) = (FakeHerdr::new(session("working", "● pinned")), TempDir::new());
+            let mut tabs = make(&server, &dir, "");
+            server.state().fail_rename = true;
+            tick(&mut tabs);
+            server.state().fail_rename = false;
+            let mut restarted = make(&server, &dir, "");
+            tick(&mut restarted);
+            assert_eq!(server.label("w1:t2"), "◐ ● pinned");
+            restarted.clear();
+            assert_eq!(server.label("w1:t2"), "● pinned");
+        }
+
+        const SESSION: &str = "12345678-1234-1234-1234-123456789abc";
+
+        fn codex_titled(data: &mut Value) {
+            let agent = &mut list(data, "agents")[0];
+            set(agent, "agent", Value::str("codex"));
+            set(agent, "terminal_title_stripped", Value::str("Repair OAuth | app"));
+            let id = pyjson::loads(&format!(r#"{{"agent": "codex", "kind": "id", "value": "{}"}}"#, SESSION)).unwrap();
+            set(agent, "agent_session", id);
+        }
+
+        fn titled(titles: &mut crate::auto_title::AutoTitles, tabs: &mut TabStatus) {
+            let snapshot = tabs.snapshot().unwrap();
+            let snapshot = titles.apply(tabs, snapshot).unwrap();
+            tabs.apply(&snapshot);
+        }
+
+        #[test]
+        fn auto_title_arrives_decorated_in_one_rename() {
+            let _env = env_lock();
+            let mut vars = quiet_env();
+            let mut data = session("working", "2");
+            set(&mut list(&mut data, "tabs")[1], "number", Value::Int(2));
+            codex_titled(&mut data);
+            let (server, dir) = (FakeHerdr::new(data), TempDir::new());
+            let mut tabs = make(&server, &dir, "");
+            vars.set("HERDR_PLUGIN_STATE_DIR", dir.path()).set("HERDR_AUTO_TITLE_TRANSCRIPT", "true");
+            let mut titles = crate::auto_title::AutoTitles::new();
+            titles.configure(&config(r#"{"auto_titles": true}"#));
+            titled(&mut titles, &mut tabs);
+            assert_eq!(server.renames(), pair("w1:t2", "◐ Repair OAuth"));
+            // Ownership sees the bare title, so later task titles keep flowing.
+            edit(&server, |d| {
+                set(&mut list(d, "agents")[0], "terminal_title_stripped", Value::str("Repair OAuth callbacks | app"))
+            });
+            titled(&mut titles, &mut tabs);
+            assert_eq!(server.label("w1:t2"), "◐ Repair OAuth callbacks");
+        }
+
+        #[test]
+        fn conflict_blocks_task_titles_even_if_other_plugin_restores_a_number() {
+            let _env = env_lock();
+            let mut vars = quiet_env();
+            vars.remove("HERDR_PLUGIN_STATE_DIR").remove("HERDR_AUTO_TITLE_TRANSCRIPT");
+            let mut data = session("working", "2");
+            codex_titled(&mut data);
+            let (server, dir) = (FakeHerdr::new(data), TempDir::new());
+            let mut tabs = make(&server, &dir, "");
+            let mut titles = crate::auto_title::AutoTitles::new();
+            titles.configure(&config(r#"{"auto_titles": true}"#));
+            titled(&mut titles, &mut tabs);
+            edit(&server, |d| set(&mut list(d, "tabs")[1], "label", Value::str("2")));
+            for _ in 0..3 {
+                titled(&mut titles, &mut tabs);
+            }
+            assert_eq!(server.renames(), pair("w1:t2", "◐ Repair OAuth"));
+            assert_eq!(server.label("w1:t2"), "2");
+        }
+
+        #[test]
+        fn subscriptions_follow_agent_panes_only() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let (server, dir) = (FakeHerdr::new(session("working", "2")), TempDir::new());
+            let mut tabs = make(&server, &dir, "");
+            tabs.snapshot().unwrap();
+            let expected = pyjson::loads(
+                r#"[{"type": "pane.agent_detected"}, {"type": "pane.agent_status_changed", "pane_id": "w1:p2"}]"#,
+            )
+            .unwrap();
+            assert_eq!(Value::List(tabs.subscriptions()), expected);
+            tabs.configure(&config(r#"{"tab_status": false}"#));
+            assert_eq!(tabs.subscriptions(), vec![]);
+        }
+    }
+
+    /// EventStreamTest: a stand-in Herdr that holds the subscription open.
+    #[cfg(unix)]
+    mod event_stream {
+        use super::*;
+        use crate::client::EventStream;
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::sync::mpsc;
+
+        fn wanted() -> Vec<Value> {
+            vec![dict(vec![("type", Value::str("pane.agent_status_changed")), ("pane_id", Value::str("w1:p2"))])]
+        }
+
+        /// Accept connections, hand each request and its stream to the test.
+        fn serve(reply: &'static [u8]) -> (String, mpsc::Receiver<(Value, UnixStream)>) {
+            let path = crate::testutil::socket_path();
+            let listener = UnixListener::bind(&path).unwrap();
+            let (send, receive) = mpsc::channel();
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut conn) = conn else { break };
+                    let mut line = String::new();
+                    let _ = BufReader::new(&conn).read_line(&mut line);
+                    let _ = conn.write_all(reply);
+                    if send.send((pyjson::loads(&line).unwrap_or(Value::Null), conn)).is_err() {
+                        break;
+                    }
+                }
+            });
+            (path.to_string_lossy().into_owned(), receive)
+        }
+
+        fn no_connection(receive: &mpsc::Receiver<(Value, UnixStream)>) -> bool {
+            receive.recv_timeout(Duration::from_millis(100)).is_err()
+        }
+
+        #[test]
+        fn events_wake_and_silence_times_out() {
+            let (path, receive) = serve(b"{\"id\":\"bar-events\",\"result\":{\"type\":\"subscription_started\"}}\n");
+            let mut stream = EventStream::new(Some(path), 2.0);
+            stream.follow(&wanted()).unwrap();
+            let (request, mut held) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(request.get("params").get("subscriptions"), &Value::List(wanted()));
+            let started = Instant::now();
+            assert!(!stream.wait(0.05));
+            assert!(started.elapsed() < Duration::from_secs(1));
+            held.write_all(b"{\"event\":\"pane.agent_status_changed\",\"data\":{}}\n").unwrap();
+            assert!(stream.wait(2.0));
+            stream.follow(&wanted()).unwrap(); // unchanged: no reconnect
+            assert!(no_connection(&receive));
+            drop(held);
+            assert!(stream.wait(2.0), "a dropped stream wakes the caller");
+            // The stream is gone: waiting just sleeps.
+            assert!(!stream.wait(0.01));
+            stream.follow(&wanted()).unwrap();
+            assert!(no_connection(&receive), "reconnects wait for the retry delay");
+            stream.close();
+        }
+
+        #[test]
+        fn refused_subscription_raises() {
+            let (path, receive) = serve(b"{\"id\":\"bar-events\",\"error\":{\"code\":\"pane_not_found\",\"message\":\"gone\"}}\n");
+            let mut stream = EventStream::new(Some(path), 2.0);
+            let gone = [dict(vec![("type", Value::str("pane.agent_status_changed")), ("pane_id", Value::str("w1:p9"))])];
+            assert!(stream.follow(&gone).is_err());
+            let (_, conn) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(conn);
+            // No connection kept: waiting just sleeps, and retries back off.
+            assert!(!stream.wait(0.01));
+            stream.follow(&gone).unwrap();
+            assert!(no_connection(&receive));
+        }
+
+        #[test]
+        fn event_coalesced_with_acknowledgement_is_not_lost() {
+            let (path, receive) = serve(
+                b"{\"result\":{\"type\":\"subscription_started\"}}\n{\"event\":\"pane.agent_status_changed\"}\n",
+            );
+            let mut stream = EventStream::new(Some(path), 2.0);
+            stream.follow(&[dict(vec![("type", Value::str("pane.agent_detected"))])]).unwrap();
+            let (_, _held) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            let started = Instant::now();
+            assert!(stream.wait(1.0));
+            assert!(started.elapsed() < Duration::from_millis(500));
+            assert!(!stream.wait(0.0));
+            stream.close();
+        }
+
+        #[test]
+        fn continuous_event_traffic_does_not_trap_the_waiter() {
+            let (path, receive) = serve(b"{\"result\":{\"type\":\"subscription_started\"}}\n");
+            let mut stream = EventStream::new(Some(path), 2.0);
+            stream.follow(&wanted()).unwrap();
+            let (_, held) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            // Keep writing for longer than the wait may take.
+            let writer = std::thread::spawn(move || {
+                let mut held = held;
+                let chunk = vec![b'x'; 65536];
+                let until = Instant::now() + Duration::from_millis(500);
+                while Instant::now() < until {
+                    if held.write_all(&chunk).is_err() {
+                        break;
+                    }
+                }
+            });
+            let started = Instant::now();
+            assert!(stream.wait(1.0));
+            assert!(started.elapsed() < Duration::from_millis(500));
+            stream.close();
+            writer.join().unwrap();
+        }
+
+        #[test]
+        fn invalid_acknowledgement_closes_stream_and_backs_off() {
+            static LONG: [u8; 65537] = [b'x'; 65537];
+            for response in [&b"[]\n"[..], &LONG[..]] {
+                let (path, receive) = serve(response);
+                let mut stream = EventStream::new(Some(path), 2.0);
+                let detected = [dict(vec![("type", Value::str("pane.agent_detected"))])];
+                assert!(stream.follow(&detected).is_err(), "{}", response.len());
+                let (_, conn) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+                // Our side closed: the peer sees end of stream.
+                let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut rest = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut &conn, &mut rest);
+                assert!(!stream.wait(0.01));
+                stream.follow(&detected).unwrap();
+                assert!(no_connection(&receive), "{}", response.len());
+            }
+        }
     }
 }

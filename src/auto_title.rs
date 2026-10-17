@@ -838,4 +838,1007 @@ mod tests {
         assert!(default_agent_name(&Value::str("claude-1x"), &kind, "/src/1x"));
         assert!(!default_agent_name(&Value::str("mine"), &kind, "/src/herdr-bar"));
     }
+
+    // -- ports of tests/test_auto_title.py ------------------------------------
+
+    use crate::testutil::{env_lock, EnvVars, TempDir};
+
+    const SESSION: &str = "12345678-1234-1234-1234-123456789abc";
+    #[cfg(unix)]
+    const OTHER_SESSION: &str = "aaaaaaaa-1234-1234-1234-123456789abc";
+
+    #[cfg(unix)]
+    fn json(text: &str) -> Value {
+        pyjson::loads(text).expect("test json parses")
+    }
+
+    #[cfg(unix)]
+    fn config(text: &str) -> Config {
+        match json(text) {
+            Value::Dict(map) => Config::from_values(&map),
+            _ => unreachable!(),
+        }
+    }
+
+    fn ai_title(title: &str) -> String {
+        // json.dumps's default separators, as the Python tests wrote them.
+        format!("{{\"type\": \"ai-title\", \"aiTitle\": {}}}\n", pyjson::dumps(&Value::str(title), false))
+    }
+
+    fn append(path: &Path, text: &str) {
+        use std::io::Write;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+    }
+
+    /// Back-date the last transcript search, as patching `time.monotonic` did.
+    fn age_search(reader: &mut TranscriptReader) {
+        for state in reader.sessions.values_mut() {
+            state.searched = state.searched.and_then(|at| at.checked_sub(Duration::from_secs(11)));
+        }
+    }
+
+    // -- TranscriptTest --
+
+    struct Transcript {
+        _temp: TempDir,
+        root: PathBuf,
+        path: PathBuf,
+        reader: TranscriptReader,
+    }
+
+    impl Transcript {
+        fn new() -> Transcript {
+            let temp = TempDir::new();
+            let root = temp.path().to_path_buf();
+            let path = root.join("projects").join("-work-app").join(format!("{}.jsonl", SESSION));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let reader = TranscriptReader::new(Some(vec![root.clone()]));
+            Transcript { _temp: temp, root, path, reader }
+        }
+
+        fn write(&self, records: &[&str]) {
+            let text: String = records.iter().map(|r| format!("{}\n", r)).collect();
+            append(&self.path, &text);
+        }
+
+        fn title(&mut self) -> String {
+            self.reader.title(SESSION, "/work/app")
+        }
+    }
+
+    #[test]
+    fn latest_ai_title_wins_over_opening() {
+        let mut t = Transcript::new();
+        t.write(&[
+            r#"{"type": "user", "origin": {"kind": "human"}, "message": {"content": "Fix login\nHere is context"}}"#,
+            r#"{"type": "ai-title", "aiTitle": "Login repair"}"#,
+        ]);
+        assert_eq!(t.title(), "Login repair");
+        t.write(&[r#"{"type": "ai-title", "aiTitle": "Repair OAuth callbacks"}"#]);
+        assert_eq!(t.title(), "Repair OAuth callbacks");
+    }
+
+    #[test]
+    fn opening_ignores_tool_output_and_uses_human_text_blocks() {
+        let mut t = Transcript::new();
+        t.write(&[
+            r#"{"type": "user", "message": {"content": "tool output"}}"#,
+            r#"{"type": "user", "origin": {"kind": "human"}, "message": {"content": [{"type": "tool_result", "content": "secret output"}, {"type": "text", "text": "<system-reminder>context</system-reminder>"}, {"type": "text", "text": "Fix login\nMore detail"}]}}"#,
+        ]);
+        assert_eq!(t.title(), "Fix login");
+    }
+
+    #[test]
+    fn slash_command_and_arguments() {
+        let mut t = Transcript::new();
+        t.write(&[r#"{"type": "user", "origin": {"kind": "human"}, "message": {"content": "<command-name>/review</command-name><command-args>spec.md</command-args>"}}"#]);
+        assert_eq!(t.title(), "review spec.md");
+    }
+
+    #[test]
+    fn partial_line_waits_until_complete_and_bad_records_are_ignored() {
+        let mut t = Transcript::new();
+        std::fs::write(&t.path, b"not json\n[]\n{\"type\":\"ai-title\",\"aiTitle\":\"OAuth").unwrap();
+        assert_eq!(t.title(), "");
+        append(&t.path, " repair\"}\n");
+        assert_eq!(t.title(), "OAuth repair");
+    }
+
+    #[test]
+    fn truncated_or_replaced_file_does_not_reuse_old_title() {
+        let mut t = Transcript::new();
+        append(&t.path, &ai_title("Old title"));
+        assert_eq!(t.title(), "Old title");
+        std::fs::write(&t.path, "{}\n").unwrap();
+        assert_eq!(t.title(), "");
+        std::fs::remove_file(&t.path).unwrap();
+        append(&t.path, &ai_title("New title"));
+        assert_eq!(t.title(), "New title");
+    }
+
+    #[test]
+    fn missing_transcript_retried_and_can_be_found_under_old_cwd() {
+        let mut t = Transcript::new();
+        assert_eq!(t.reader.title(SESSION, "/work/new"), "");
+        append(&t.path, &ai_title("Moved project"));
+        age_search(&mut t.reader);
+        assert_eq!(t.reader.title(SESSION, "/work/new"), "Moved project");
+    }
+
+    #[test]
+    fn same_inode_and_size_rewrite_is_detected() {
+        let mut t = Transcript::new();
+        append(&t.path, &ai_title("Old title"));
+        assert_eq!(t.title(), "Old title");
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&t.path).unwrap().ino()
+        };
+        let size = std::fs::metadata(&t.path).unwrap().len();
+        std::fs::write(&t.path, ai_title("New title")).unwrap();
+        assert_eq!(std::fs::metadata(&t.path).unwrap().len(), size);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&t.path).unwrap().ino(), identity);
+        }
+        assert_eq!(t.title(), "New title");
+    }
+
+    #[test]
+    fn scan_is_bounded_and_terminal_controls_removed() {
+        let mut t = Transcript::new();
+        let mut big = vec![b'x'; MAX_SCAN as usize + 100];
+        big.push(b'\n');
+        std::fs::write(&t.path, big).unwrap();
+        append(&t.path, &ai_title("\x1b[31mFix\x1b[0m\nlogin\x07"));
+        assert_eq!(t.title(), "Fix login");
+    }
+
+    #[test]
+    fn invalid_session_id_cannot_escape_projects() {
+        let mut t = Transcript::new();
+        assert_eq!(t.reader.title("../../private", "/work/app"), "");
+        assert!(t.reader.sessions.is_empty());
+    }
+
+    #[test]
+    fn transcript_found_in_any_config_root() {
+        let t = Transcript::new();
+        append(&t.path, &ai_title("Second account"));
+        let empty = t.root.join("missing-root");
+        let mut reader = TranscriptReader::new(Some(vec![empty.clone(), t.root.clone()]));
+        assert_eq!(reader.title(SESSION, "/work/app"), "Second account");
+        let mut moved = TranscriptReader::new(Some(vec![empty, t.root.clone()]));
+        assert_eq!(moved.title(SESSION, "/elsewhere"), "Second account");
+    }
+
+    // -- ClaudeRootsTest --
+
+    struct Roots {
+        // Field order is drop order: restore the variables, then unlock.
+        vars: EnvVars,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        temp: TempDir,
+        config: PathBuf,
+    }
+
+    impl Roots {
+        fn new() -> Roots {
+            let lock = env_lock();
+            let temp = TempDir::new();
+            let config = temp.path().join("config");
+            std::fs::create_dir_all(&config).unwrap();
+            let home = temp.path().join("home");
+            let mut vars = EnvVars::new();
+            vars.set("HERDR_PLUGIN_CONFIG_DIR", &config)
+                .set("CLAUDE_CONFIG_DIR", "/srv/claude")
+                .set("HOME", &home)
+                .set("USERPROFILE", &home);
+            Roots { vars, _lock: lock, temp, config }
+        }
+
+        fn configure(&self, dirs: &str) {
+            std::fs::write(self.config.join("config.json"), format!("{{\"claude_config_dirs\": {}}}", dirs)).unwrap();
+        }
+    }
+
+    fn expanded(path: &str) -> PathBuf {
+        PathBuf::from(pyos::expanduser(path))
+    }
+
+    #[test]
+    fn server_root_first_then_configured_roots_deduplicated() {
+        let r = Roots::new();
+        r.configure(r#"["~/.claude-work", "/srv/claude", "", 7, "/opt/claude"]"#);
+        assert_eq!(
+            claude_roots(),
+            vec![PathBuf::from("/srv/claude"), expanded("~/.claude-work"), PathBuf::from("/opt/claude")]
+        );
+    }
+
+    #[test]
+    fn default_root_without_config() {
+        let mut r = Roots::new();
+        r.vars.set("CLAUDE_CONFIG_DIR", "");
+        assert_eq!(claude_roots(), vec![expanded("~/.claude")]);
+    }
+
+    #[test]
+    fn roots_added_later_are_searched_without_restart() {
+        let r = Roots::new();
+        let extra = r.temp.path().join("work");
+        let path = extra.join("projects").join("-work-app").join(format!("{}.jsonl", SESSION));
+        append(&path, &ai_title("Work task"));
+        let mut reader = TranscriptReader::new(None);
+        assert_eq!(reader.title(SESSION, "/work/app"), "");
+        r.configure(&pyjson::dumps(&Value::List(vec![Value::str(extra.to_string_lossy())]), false));
+        age_search(&mut reader);
+        assert_eq!(reader.title(SESSION, "/work/app"), "Work task");
+    }
+
+    // -- AutoTitlesTest / NamingPersistenceTest: a fake Herdr server --
+
+    #[cfg(unix)]
+    mod fake {
+        use crate::pyjson::{self, Map, Value};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        type Edit = Box<dyn FnOnce(&mut Value) + Send>;
+
+        pub struct State {
+            pub snapshot: Value,
+            /// `(tab_id, label)` per `tab.rename`, as FakeClient.calls.
+            pub calls: Vec<(String, String)>,
+            pub rename_error: Option<String>,
+            /// `session.snapshot` requests answered.
+            pub reads: usize,
+            /// Change the session just before answering this read.
+            pub edit_at: Option<(usize, Edit)>,
+        }
+
+        pub struct Fake {
+            pub path: PathBuf,
+            pub state: Arc<Mutex<State>>,
+            stop: Arc<AtomicBool>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+
+        fn result(entries: Vec<(&str, Value)>) -> Value {
+            let mut inner = Map::new();
+            for (key, value) in entries {
+                inner.insert(key, value);
+            }
+            let mut out = Map::new();
+            out.insert("id", Value::str("bar"));
+            out.insert("result", Value::Dict(inner));
+            Value::Dict(out)
+        }
+
+        fn answer(state: &Mutex<State>, request: &Value) -> Value {
+            let mut state = state.lock().unwrap();
+            match request.get("method").as_str().unwrap_or("") {
+                "session.snapshot" => {
+                    state.reads += 1;
+                    if state.edit_at.as_ref().map(|(at, _)| *at == state.reads).unwrap_or(false) {
+                        let (_, edit) = state.edit_at.take().unwrap();
+                        edit(&mut state.snapshot);
+                    }
+                    result(vec![("snapshot", state.snapshot.clone())])
+                }
+                "plugin.list" => result(vec![("plugins", Value::List(Vec::new()))]),
+                "tab.rename" => {
+                    let params = request.get("params");
+                    let tab_id = params.get("tab_id").as_str().unwrap_or("").to_string();
+                    let label = params.get("label").as_str().unwrap_or("").to_string();
+                    state.calls.push((tab_id.clone(), label.clone()));
+                    if let Some(message) = state.rename_error.clone() {
+                        return pyjson::loads(&format!(
+                            "{{\"id\": \"bar\", \"error\": {{\"message\": {}}}}}",
+                            pyjson::dumps(&Value::str(message), false)
+                        ))
+                        .unwrap();
+                    }
+                    if let Some(Value::List(tabs)) = state.snapshot.as_dict_mut().and_then(|s| s.get_mut("tabs")) {
+                        for tab in tabs.iter_mut() {
+                            if tab.get("tab_id").as_str() == Some(tab_id.as_str()) {
+                                tab.as_dict_mut().unwrap().insert("label", Value::str(label.clone()));
+                            }
+                        }
+                    }
+                    result(vec![])
+                }
+                other => pyjson::loads(&format!("{{\"id\": \"bar\", \"error\": {{\"message\": \"unknown {}\"}}}}", other)).unwrap(),
+            }
+        }
+
+        impl Fake {
+            pub fn start(snapshot: Value) -> Fake {
+                let path = crate::testutil::socket_path();
+                let listener = UnixListener::bind(&path).unwrap();
+                let state = Arc::new(Mutex::new(State { snapshot, calls: Vec::new(), rename_error: None, reads: 0, edit_at: None }));
+                let stop = Arc::new(AtomicBool::new(false));
+                let (shared, stopping) = (state.clone(), stop.clone());
+                let thread = std::thread::spawn(move || {
+                    for conn in listener.incoming() {
+                        if stopping.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let Ok(mut conn) = conn else { continue };
+                        let mut line = String::new();
+                        if BufReader::new(&conn).read_line(&mut line).is_err() {
+                            continue;
+                        }
+                        let Ok(request) = pyjson::loads(&line) else { continue };
+                        let mut reply = pyjson::dumps(&answer(&shared, &request), false);
+                        reply.push('\n');
+                        let _ = conn.write_all(reply.as_bytes());
+                    }
+                });
+                Fake { path, state, stop, thread: Some(thread) }
+            }
+        }
+
+        impl Drop for Fake {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::SeqCst);
+                let _ = UnixStream::connect(&self.path);
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn title_snapshot() -> Value {
+        json(&format!(
+            r#"{{"tabs": [{{"tab_id": "w1:t9", "workspace_id": "w1", "number": 9, "label": "1"}}],
+                "panes": [{{"pane_id": "w1:p9", "tab_id": "w1:t9", "terminal_id": "term9"}}],
+                "agents": [{{"pane_id": "w1:p9", "tab_id": "w1:t9", "agent": "claude", "cwd": "/work/app",
+                             "agent_session": {{"agent": "claude", "kind": "id", "value": "{}"}}}}]}}"#,
+            SESSION
+        ))
+    }
+
+    /// `snapshot[group][0]`, as a dict.
+    #[cfg(unix)]
+    fn first<'a>(snapshot: &'a mut Value, group: &str) -> &'a mut Map {
+        match snapshot.as_dict_mut().unwrap().get_mut(group).unwrap() {
+            Value::List(items) => items[0].as_dict_mut().unwrap(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// The fixture of AutoTitlesTest: a fake server, titles that read the
+    /// transcript `set_title` writes, and the plugin's tab client.
+    #[cfg(unix)]
+    struct Titles {
+        titles: AutoTitles,
+        client: TabStatus,
+        fake: fake::Fake,
+        transcript: PathBuf,
+        root: PathBuf,
+        temp: TempDir,
+        vars: EnvVars,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl Titles {
+        fn new() -> Titles {
+            let lock = env_lock();
+            let temp = TempDir::new();
+            let config = temp.path().join("config");
+            std::fs::create_dir_all(&config).unwrap();
+            let root = temp.path().join("claude");
+            let transcript = root.join("projects").join("-work-app").join(format!("{}.jsonl", SESSION));
+            let home = temp.path().join("home");
+            let mut vars = EnvVars::new();
+            vars.set("HERDR_AUTO_TITLE_TRANSCRIPT", "true")
+                .set("HERDR_PLUGIN_CONFIG_DIR", &config)
+                .set("CLAUDE_CONFIG_DIR", &root)
+                .set("HOME", &home)
+                .remove("HERDR_PLUGIN_STATE_DIR")
+                .remove("HERDR_SOCKET_PATH");
+            let fake = fake::Fake::start(title_snapshot());
+            let herdr = crate::client::HerdrClient::new(Some(fake.path.to_string_lossy().into_owned()), 5.0, true);
+            let client = TabStatus::new(crate::renaming_guard::AutomaticTabClient::new(herdr), None);
+            let mut out = Titles { titles: AutoTitles::new(), client, fake, transcript, root, temp, vars, _lock: lock };
+            out.restart();
+            out.set_title("Repair login");
+            out
+        }
+
+        /// A new `AutoTitles`, as a watcher restart makes.
+        fn restart(&mut self) {
+            self.titles = AutoTitles::new();
+            self.titles.reader = TranscriptReader::new(Some(vec![self.root.clone()]));
+        }
+
+        /// What the transcript reader returns from now on.
+        fn set_title(&self, title: &str) {
+            append(&self.transcript, &ai_title(title));
+        }
+
+        fn reader_called(&self) -> bool {
+            !self.titles.reader.sessions.is_empty()
+        }
+
+        fn apply(&mut self) -> Value {
+            let snapshot = self.client.snapshot().unwrap();
+            let result = self.titles.apply(&mut self.client, snapshot).unwrap();
+            let out = result.borrow().clone();
+            out
+        }
+
+        fn edit(&self, edit: impl FnOnce(&mut Value)) {
+            edit(&mut self.fake.state.lock().unwrap().snapshot);
+        }
+
+        /// Replace the session and forget earlier renames, as a new FakeClient.
+        fn reset(&self, snapshot: Value) {
+            let mut state = self.fake.state.lock().unwrap();
+            state.snapshot = snapshot;
+            state.calls.clear();
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.fake.state.lock().unwrap().calls.iter().map(|(_, label)| label.clone()).collect()
+        }
+
+        fn rename_calls(&self) -> Vec<(String, String)> {
+            self.fake.state.lock().unwrap().calls.clone()
+        }
+
+        fn reads(&self) -> usize {
+            self.fake.state.lock().unwrap().reads
+        }
+
+        fn label(&self) -> Value {
+            let mut state = self.fake.state.lock().unwrap();
+            first(&mut state.snapshot, "tabs").get("label").cloned().unwrap_or(Value::Null)
+        }
+
+        fn agent(&self, key: &str, value: Value) {
+            self.edit(|s| first(s, "agents").insert(key, value));
+        }
+
+        fn drop_session(&self) {
+            self.edit(|s| {
+                first(s, "agents").remove("agent_session");
+            });
+        }
+
+        fn codex(&self) {
+            self.edit(|s| {
+                let agent = first(s, "agents");
+                agent.insert("agent", Value::str("codex"));
+                if let Some(Value::Dict(session)) = agent.get_mut("agent_session") {
+                    session.insert("agent", Value::str("codex"));
+                }
+            });
+        }
+
+        fn use_state_dir(&mut self) -> PathBuf {
+            let state = self.temp.path().join("state");
+            self.vars.set("HERDR_PLUGIN_STATE_DIR", &state);
+            state
+        }
+    }
+
+    #[cfg(unix)]
+    fn session_value(value: &str) -> Value {
+        json(&format!(r#"{{"agent": "claude", "kind": "id", "value": "{}"}}"#, value))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_is_display_position_not_monotonic_tab_number() {
+        let mut t = Titles::new();
+        let result = t.apply();
+        assert_eq!(first(&mut result.clone(), "tabs").get("label"), Some(&Value::str("Repair login")));
+        assert_eq!(t.rename_calls(), vec![("w1:t9".to_string(), "Repair login".to_string())]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lowercase_titles_cover_terminal_and_transcript_sources() {
+        let mut t = Titles::new();
+        t.titles.configure(&config(r#"{"lowercase_titles": true}"#));
+        t.set_title("Repair ÉTÉ API");
+        for source in ["claude_transcript", "claude_terminal", "codex_terminal"] {
+            t.titles.owned = Map::new();
+            t.reset(title_snapshot());
+            if source.ends_with("terminal") {
+                t.agent("terminal_title_stripped", Value::str("Repair ÉTÉ API | app"));
+            }
+            if source == "codex_terminal" {
+                t.codex();
+            }
+            t.apply();
+            t.apply();
+            assert_eq!(t.rename_calls(), vec![("w1:t9".to_string(), "repair été api".to_string())], "{}", source);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lowercase_config_changes_preserve_ownership_and_custom_names() {
+        let mut t = Titles::new();
+        t.apply();
+        t.titles.configure(&config(r#"{"lowercase_titles": true}"#));
+        t.apply();
+        t.apply();
+        t.titles.configure(&config(r#"{"lowercase_titles": false}"#));
+        t.apply();
+        t.edit(|s| first(s, "tabs").insert("label", Value::str("My API work")));
+        t.titles.configure(&config(r#"{"lowercase_titles": true}"#));
+        t.set_title("New task");
+        t.apply();
+        assert_eq!(t.calls(), vec!["Repair login", "repair login", "Repair login"]);
+        assert_eq!(t.label(), Value::str("My API work"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_names_follow_transcript_changes() {
+        let mut t = Titles::new();
+        t.apply();
+        t.set_title("New task");
+        t.apply();
+        t.restart();
+        t.apply();
+        assert_eq!(t.calls().len(), 2);
+        assert_eq!(t.calls().last().unwrap(), "New task");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_title_updates_without_transcripts_and_ignores_folder() {
+        let mut t = Titles::new();
+        t.codex();
+        t.agent("terminal_title_stripped", Value::str("app"));
+        t.apply();
+        assert!(t.calls().is_empty());
+        t.agent("terminal_title_stripped", Value::str("Repair login | app"));
+        t.apply();
+        t.apply();
+        assert_eq!(t.calls().len(), 1);
+        t.agent("terminal_title_stripped", Value::str("Repair OAuth | app"));
+        t.apply();
+        assert_eq!(t.calls().last().unwrap(), "Repair OAuth");
+        assert!(!t.reader_called());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_console_default_title_is_not_a_task() {
+        let mut t = Titles::new();
+        t.codex();
+        for title in [
+            r"C:\Program Files\PowerShell\7\pwsh.EXE",
+            r"Administrator: C:\WINDOWS\system32\cmd.exe",
+            r"\\server\tools\codex.cmd",
+        ] {
+            t.agent("terminal_title_stripped", Value::str(title));
+            t.apply();
+        }
+        assert!(t.calls().is_empty());
+        t.agent("terminal_title_stripped", Value::str(r"Fix C:\temp\build.cmd quoting"));
+        t.apply();
+        assert_eq!(t.calls().last().unwrap(), r"Fix C:\temp\build.cmd quoting");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_survives_restart_and_manual_rename_relinquishes_it() {
+        let mut t = Titles::new();
+        t.use_state_dir();
+        t.restart();
+        t.set_title("Initial task");
+        t.apply();
+        t.restart();
+        t.set_title("Better task");
+        t.apply();
+        assert_eq!(t.calls().last().unwrap(), "Better task");
+        t.edit(|s| first(s, "tabs").insert("label", Value::str("My choice")));
+        t.apply();
+        assert_eq!(Value::Dict(t.titles.owned.clone()), json(r#"{"w1:t9": {"yielded": true}}"#));
+        assert_eq!(t.label(), Value::str("My choice"));
+        assert_eq!(t.calls().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_titles_without_session_ids_follow_updates() {
+        let mut t = Titles::new();
+        for kind in ["codex", "claude"] {
+            t.titles.owned = Map::new();
+            t.reset(title_snapshot());
+            t.drop_session();
+            t.agent("agent", Value::str(kind));
+            t.agent("terminal_title_stripped", Value::str("Repair login | app"));
+            t.apply();
+            assert_eq!(t.calls().last().unwrap(), "Repair login", "{}", kind);
+            t.agent("terminal_title_stripped", Value::str("Updated task | app"));
+            t.apply();
+            assert_eq!(t.calls().last().unwrap(), "Updated task", "{}", kind);
+        }
+        assert!(!t.reader_called());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sessionless_titles_require_terminal_identity_and_preserve_custom_names() {
+        let mut t = Titles::new();
+        let cases = [
+            ("panes", "terminal_id", Value::Null),
+            ("tabs", "label", Value::str("My name")),
+            ("panes", "label", Value::str("My pane")),
+            ("agents", "name", Value::str("My agent")),
+            ("agents", "terminal_title_stripped", Value::str("app")),
+        ];
+        for (group, key, value) in cases {
+            t.reset(title_snapshot());
+            t.drop_session();
+            t.agent("terminal_title_stripped", Value::str("Task | app"));
+            t.edit(|s| first(s, group).insert(key, value));
+            t.apply();
+            assert!(t.calls().is_empty(), "{}.{}", group, key);
+        }
+        assert!(!t.reader_called());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sessionless_ownership_survives_restart_and_yields_to_manual_rename() {
+        let mut t = Titles::new();
+        t.use_state_dir();
+        t.drop_session();
+        t.agent("terminal_title_stripped", Value::str("First task"));
+        t.restart();
+        t.apply();
+        t.restart();
+        t.agent("terminal_title_stripped", Value::str("Second task"));
+        t.apply();
+        assert_eq!(t.calls().last().unwrap(), "Second task");
+        t.edit(|s| first(s, "tabs").insert("label", Value::str("Manual")));
+        t.apply();
+        assert_eq!(t.calls().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sessionless_ownership_rejects_replacement_terminal() {
+        let mut t = Titles::new();
+        t.drop_session();
+        t.agent("terminal_title_stripped", Value::str("First task"));
+        t.apply();
+        t.edit(|s| first(s, "panes").insert("terminal_id", Value::str("replacement")));
+        t.agent("terminal_title_stripped", Value::str("Different task"));
+        t.apply();
+        assert_eq!(t.calls().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_id_arriving_later_keeps_ownership() {
+        let mut t = Titles::new();
+        t.drop_session();
+        t.agent("terminal_title_stripped", Value::str("First task"));
+        t.apply();
+        t.agent("agent_session", session_value(SESSION));
+        t.agent("terminal_title_stripped", Value::str("Second task"));
+        t.apply();
+        assert_eq!(t.calls().last().unwrap(), "Second task");
+        t.agent("agent_session", session_value(OTHER_SESSION));
+        t.agent("terminal_title_stripped", Value::str("Different session"));
+        t.apply();
+        assert_eq!(t.calls().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_session_cannot_claim_a_previously_owned_name() {
+        let mut t = Titles::new();
+        t.apply();
+        t.agent("agent_session", session_value(OTHER_SESSION));
+        let other = t.root.join("projects").join("-work-app").join(format!("{}.jsonl", OTHER_SESSION));
+        append(&other, &ai_title("Different session"));
+        t.apply();
+        assert_eq!(t.calls().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_id_arriving_with_unchanged_title_blocks_later_replacement() {
+        let mut t = Titles::new();
+        t.drop_session();
+        t.agent("terminal_title_stripped", Value::str("First task"));
+        t.apply();
+        t.agent("agent_session", session_value(SESSION));
+        t.apply();
+        t.agent("agent_session", session_value(OTHER_SESSION));
+        t.agent("terminal_title_stripped", Value::str("Different session"));
+        t.apply();
+        assert_eq!(t.calls().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_custom_names_are_preserved_on_first_open() {
+        let mut t = Titles::new();
+        for lowercase in [false, true] {
+            t.titles.configure(&config(&format!("{{\"lowercase_titles\": {}}}", lowercase)));
+            for label in ["My work", "claude", "9", "1 · app › claude › Repair login", "Repair login"] {
+                t.edit(|s| first(s, "tabs").insert("label", Value::str(label)));
+                t.apply();
+            }
+        }
+        assert!(t.calls().is_empty());
+        assert!(!t.reader_called());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_pane_and_agent_names_are_preserved() {
+        let mut t = Titles::new();
+        for (group, key) in [("panes", "label"), ("agents", "name")] {
+            for label in ["My work", "claude"] {
+                t.edit(|s| {
+                    *s = title_snapshot();
+                    first(s, group).insert(key, Value::str(label));
+                });
+                t.apply();
+            }
+        }
+        assert!(t.calls().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_derived_agent_names_are_defaults() {
+        // herdr agent start needs a name, so launchers pass the folder's.
+        let mut t = Titles::new();
+        let folder = "app";
+        for name in [folder.to_string(), format!("{}-2", folder)] {
+            t.titles.owned = Map::new();
+            t.reset(title_snapshot());
+            t.agent("name", Value::str(name.clone()));
+            t.apply();
+            assert_eq!(t.rename_calls(), vec![("w1:t9".to_string(), "Repair login".to_string())], "{}", name);
+        }
+        for name in [format!("{}-reviewer", folder), format!("{}-2", &folder[..1]), format!("{}-1", folder)] {
+            t.titles.owned = Map::new();
+            t.reset(title_snapshot());
+            t.agent("name", Value::str(name.clone()));
+            t.apply();
+            assert!(t.calls().is_empty(), "{}", name);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_default_name_does_not_reclaim_ownership() {
+        let mut t = Titles::new();
+        t.apply();
+        t.edit(|s| first(s, "tabs").insert("label", Value::str("")));
+        t.set_title("New task");
+        t.apply();
+        assert_eq!(t.calls().len(), 1);
+        assert_eq!(t.label(), Value::str(""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_positions_count_shell_tabs_and_reset_per_workspace() {
+        let mut t = Titles::new();
+        t.edit(|s| {
+            let Some(Value::List(tabs)) = s.as_dict_mut().unwrap().get_mut("tabs") else { unreachable!() };
+            tabs.insert(0, json(r#"{"tab_id": "w2:t50", "workspace_id": "w2", "label": "shell", "number": 50}"#));
+            tabs.insert(1, json(r#"{"tab_id": "w1:t8", "workspace_id": "w1", "label": "shell", "number": 8}"#));
+            tabs.last_mut().unwrap().as_dict_mut().unwrap().insert("label", Value::str("2"));
+        });
+        t.apply();
+        assert_eq!(t.calls().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multiple_agents_other_agents_and_missing_sessions_are_skipped() {
+        let mut t = Titles::new();
+        let mut cases = Vec::new();
+        let mut data = title_snapshot();
+        let mut extra = Value::Dict(first(&mut data, "agents").clone());
+        extra.as_dict_mut().unwrap().insert("pane_id", Value::str("w1:p10"));
+        if let Some(Value::List(agents)) = data.as_dict_mut().unwrap().get_mut("agents") {
+            agents.push(extra);
+        }
+        cases.push(data);
+        let mut data = title_snapshot();
+        first(&mut data, "agents").insert("agent", Value::str("codex"));
+        cases.push(data);
+        let mut data = title_snapshot();
+        first(&mut data, "agents").remove("agent_session");
+        cases.push(data);
+        for data in cases {
+            t.edit(|s| *s = data);
+            t.apply();
+        }
+        assert!(t.calls().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_or_session_switch_during_read_is_respected() {
+        let mut t = Titles::new();
+        let cases = [
+            ("tabs", "label", Value::str("Manual title")),
+            ("panes", "label", Value::str("Plugin name")),
+            ("panes", "terminal_id", Value::str("replacement")),
+        ];
+        for (group, key, value) in cases {
+            t.edit(|s| *s = title_snapshot());
+            // The read after the one `apply` hands over: the re-check that
+            // follows the transcript read.
+            let at = t.reads() + 2;
+            t.fake.state.lock().unwrap().edit_at = Some((
+                at,
+                Box::new(move |s: &mut Value| {
+                    first(s, group).insert(key, value);
+                }),
+            ));
+            t.apply();
+            assert!(t.fake.state.lock().unwrap().edit_at.is_none(), "{}.{}: change not made", group, key);
+        }
+        assert!(t.calls().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failure_does_not_pretend_tab_was_renamed() {
+        let mut t = Titles::new();
+        t.fake.state.lock().unwrap().rename_error = Some("connection failed".into());
+        let mut result = t.apply();
+        assert_eq!(first(&mut result, "tabs").get("label"), Some(&Value::str("1")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opt_out_does_not_read_transcripts_or_mutate_session() {
+        let mut t = Titles::new();
+        t.vars.set("HERDR_AUTO_TITLE_TRANSCRIPT", "false");
+        t.restart();
+        t.vars.set("HERDR_AUTO_TITLE_TRANSCRIPT", "true");
+        t.apply();
+        assert!(!t.reader_called());
+        assert!(t.calls().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_can_disable_and_reenable_titles_without_restart() {
+        let mut t = Titles::new();
+        t.titles.configure(&config(r#"{"auto_titles": false}"#));
+        t.apply();
+        assert!(t.calls().is_empty());
+        assert!(!t.reader_called());
+        t.titles.configure(&config(r#"{"auto_titles": true}"#));
+        t.apply();
+        assert_eq!(t.calls().last().unwrap(), "Repair login");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn popup_only_reads_titles_written_by_watcher() {
+        let mut t = Titles::new();
+        let socket = t.fake.path.to_string_lossy().into_owned();
+        let popup = crate::client::HerdrClient::new(Some(socket), 5.0, true);
+        let config = Config::default();
+        let snapshot = t.fake.state.lock().unwrap().snapshot.clone();
+        let pool = crate::app::Pool::build(&snapshot, &config);
+        let mut bar = crate::app::Bar::new(popup, config, crate::mru::Recents::new(None), crate::theme::Theme::new(None, None, None));
+        bar.bootstrap(Ok(pool), Vec::new()).unwrap();
+        assert!(t.calls().is_empty());
+        // A fresh AutoTitles reading the real roots: CLAUDE_CONFIG_DIR.
+        t.titles = AutoTitles::new();
+        t.apply();
+        bar.refresh(true);
+        assert_eq!(bar.items()[0].title, "Repair login");
+        t.edit(|s| first(s, "tabs").insert("label", Value::str("My choice")));
+        bar.refresh(true);
+        assert_eq!(bar.items()[0].title, "My choice");
+        assert_eq!(t.calls().len(), 1);
+    }
+
+    // -- NamingPersistenceTest --
+
+    #[cfg(unix)]
+    fn persisted() -> Titles {
+        let mut t = Titles::new();
+        t.use_state_dir();
+        t.vars.set("HERDR_SOCKET_PATH", "/test/server.sock");
+        t.restart();
+        t.codex();
+        t.agent("terminal_title_stripped", Value::str("Task title | app"));
+        t
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_default_name_stays_unowned_after_restart() {
+        let mut t = persisted();
+        t.apply();
+        t.edit(|s| first(s, "tabs").insert("label", Value::str("1")));
+        t.apply();
+        t.restart();
+        t.apply();
+        assert_eq!(t.calls().len(), 1);
+        assert_eq!(t.label(), Value::str("1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn busy_lock_returns_without_server_requests_or_mutation() {
+        let mut t = persisted();
+        let state_dir = t.titles.state_dir.clone().unwrap();
+        assert!(state_dir.starts_with(t.temp.path().join("state").join("title-servers")));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let lock = std::fs::OpenOptions::new().append(true).create(true).open(state_dir.join("auto-titles.lock")).unwrap();
+        host::lock(&lock, true).unwrap();
+        let snapshot = crate::tab_status::shared(t.fake.state.lock().unwrap().snapshot.clone());
+        let reads = t.reads();
+        t.titles.apply(&mut t.client, snapshot).unwrap();
+        assert_eq!(t.reads(), reads);
+        drop(lock);
+        assert!(t.calls().is_empty());
+        assert!(!state_dir.join("auto-titles.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_tick_uses_supplied_snapshot_and_does_not_write_state() {
+        use std::os::unix::fs::MetadataExt;
+        let mut t = persisted();
+        t.apply();
+        let path = t.titles.state_dir.clone().unwrap().join("auto-titles.json");
+        let before = std::fs::metadata(&path).unwrap();
+        let snapshot = t.client.snapshot().unwrap();
+        let reads = t.reads();
+        t.titles.apply(&mut t.client, snapshot).unwrap();
+        assert_eq!(t.reads(), reads);
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!((after.mtime(), after.mtime_nsec(), after.ino()), (before.mtime(), before.mtime_nsec(), before.ino()));
+        assert_eq!(t.calls().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_directory_and_write_errors_skip_rename_and_recover() {
+        let mut t = persisted();
+        let state_dir = t.titles.state_dir.clone().unwrap();
+        // The state directory cannot be made: its parent is a file.
+        let blocker = t.temp.path().join("blocker");
+        std::fs::write(&blocker, "").unwrap();
+        t.titles.state_dir = Some(blocker.join("state"));
+        t.apply();
+        t.titles.state_dir = Some(state_dir.clone());
+        // The staging file cannot be written: a directory is in its place.
+        let staging = state_dir.join("auto-titles.tmp");
+        std::fs::create_dir_all(&staging).unwrap();
+        t.apply();
+        assert!(t.calls().is_empty());
+        std::fs::remove_dir(&staging).unwrap();
+        t.apply();
+        assert_eq!(t.calls().last().unwrap(), "Task title");
+    }
 }

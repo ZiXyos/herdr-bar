@@ -182,3 +182,24 @@ pub fn default_selection_background(appearance: Option<&str>) -> Option<&'static
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secondary_text_is_brighter_than_the_separators() {
+        for appearance in [None, Some("dark"), Some("light")] {
+            let theme = Theme::new(None, None, appearance);
+            assert_ne!(theme.fg("muted"), theme.fg("unknown"), "{:?}", appearance);
+        }
+    }
+
+    #[test]
+    fn a_configured_muted_wins_over_the_appearance() {
+        let mut overrides = Map::new();
+        overrides.insert("muted", Value::Str("#ff00ff".into()));
+        let theme = Theme::new(Some(&overrides), None, Some("dark"));
+        assert_eq!(theme.fg("muted"), "\x1b[38;2;255;0;255m");
+    }
+}

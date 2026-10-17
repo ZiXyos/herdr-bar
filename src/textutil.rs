@@ -250,4 +250,109 @@ mod tests {
         assert_eq!(strip_ansi("\x1b]0;t\x07x"), "x");
         assert_eq!(strip_ansi("\x1b]unterminated"), "unterminated");
     }
+
+    // Ported from the Python release's tests/test_textutil.py.
+
+    fn at(text: &str, positions: &[usize]) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        positions.iter().map(|&i| chars[i]).collect()
+    }
+
+    #[test]
+    fn ascii() { assert_eq!(display_width("hello"), 5); }
+
+    #[test]
+    fn wide_characters_count_double() { assert_eq!(display_width("日本"), 4); }
+
+    #[test]
+    fn combining_marks_are_free() { assert_eq!(display_width("e\u{301}"), 1); }
+
+    #[test]
+    fn control_characters_are_free() { assert_eq!(display_width("a\x07b"), 2); }
+
+    #[test]
+    fn visible_width_ignores_styling() { assert_eq!(visible_width("\x1b[38;5;12mhi\x1b[0m"), 2); }
+
+    #[test]
+    fn strips_escape_sequences() { assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red"); }
+
+    #[test]
+    fn strips_osc_sequences() { assert_eq!(strip_ansi("\x1b]0;title\x07text"), "text"); }
+
+    #[test]
+    fn replaces_control_characters() { assert_eq!(sanitize("a\x00b", " "), "a b"); }
+
+    #[test]
+    fn expands_tabs() { assert_eq!(sanitize("a\tb", " "), "a    b"); }
+
+    #[test]
+    fn short_text_is_untouched() { assert_eq!(truncate("hi", 10), "hi"); }
+
+    #[test]
+    fn adds_an_ellipsis() { assert_eq!(truncate("hello world", 8), "hello w…"); }
+
+    #[test]
+    fn result_never_exceeds_the_width() {
+        for width in 1..12 {
+            assert!(display_width(&truncate("hello world", width)) <= width as usize);
+        }
+    }
+
+    #[test]
+    fn wide_characters_never_overflow() {
+        for width in 1..12 {
+            assert!(display_width(&truncate("日本語のテスト", width)) <= width as usize);
+        }
+    }
+
+    #[test]
+    fn middle_truncation_keeps_both_ends() {
+        let result = truncate_middle("/home/dev/workspace/project", 16);
+        assert!(result.starts_with("/home"), "{result}");
+        assert!(result.ends_with("ject"), "{result}");
+        assert!(display_width(&result) <= 16);
+    }
+
+    #[test]
+    fn pads_to_the_width() { assert_eq!(visible_width(&pad("hi", 6)), 6); }
+
+    #[test]
+    fn pads_styled_text_by_visible_width() { assert_eq!(visible_width(&pad("\x1b[31mhi\x1b[0m", 6)), 6); }
+
+    #[test]
+    fn never_shrinks() { assert_eq!(pad("hello", 2), "hello"); }
+
+    #[test]
+    fn short_text_keeps_its_positions() {
+        assert_eq!(window_positions("week gen", 20, &[0, 1]), ("week gen".to_string(), vec![0, 1], 0));
+    }
+
+    #[test]
+    fn positions_stay_on_the_same_characters() {
+        let source = "Redesign the week generation loading screen";
+        let marks = [15, 16, 17, 18];
+        let (text, positions, _) = window_positions(source, 20, &marks);
+        assert_eq!(at(&text, &positions), at(source, &marks));
+    }
+
+    #[test]
+    fn window_slides_to_keep_late_matches_visible() {
+        let source = "a very long tab title that ends with needle";
+        let n = source.chars().count();
+        let needle: Vec<usize> = (n - 6..n).collect();
+        let (text, positions, offset) = window_positions(source, 20, &needle);
+        assert!(offset > 0);
+        assert!(text.starts_with('…'), "{text}");
+        assert_eq!(at(&text, &positions), "needle");
+    }
+
+    #[test]
+    fn result_fits_the_width() {
+        let source = "a very long tab title that ends with needle";
+        let last = source.chars().count() - 1;
+        for width in 4..30 {
+            let (text, _, _) = window_positions(source, width, &[last]);
+            assert!(display_width(&text) <= width as usize, "{width}: {text}");
+        }
+    }
 }

@@ -68,3 +68,40 @@ pub fn open_bar() -> i32 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{env_lock, EnvVars, TempDir};
+
+    #[test]
+    fn open_hands_the_popup_to_the_herdr_cli() {
+        // What `--open` execs (POSIX) or runs (Windows); the exec itself would
+        // replace the test process.
+        let _env = env_lock();
+        let temp = TempDir::new();
+        let herdr = temp.path().join("herdr");
+        std::fs::write(&herdr, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&herdr, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut vars = EnvVars::new();
+        vars.set("HERDR_BIN_PATH", &herdr);
+        let bin = herdr.to_string_lossy().into_owned();
+        let expected: Vec<String> = [bin.as_str(), "plugin", "pane", "open", "--plugin", "herdr-bar", "--entrypoint", "bar", "--placement", "popup"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(popup_command(), expected);
+    }
+
+    #[test]
+    fn stale_bin_path_falls_back_to_path() {
+        let _env = env_lock();
+        let mut vars = EnvVars::new();
+        vars.set("HERDR_BIN_PATH", "/nonexistent/herdr");
+        assert_eq!(herdr_bin(), "herdr");
+    }
+}

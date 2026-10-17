@@ -423,19 +423,23 @@ cd herdr-bar
 HERDR_BAR_BUILD=source sh scripts/install.sh   # build this clone (Rust 1.88+)
 herdr plugin link .         # link never runs the build step, so build first
 
-cargo test --release                            # the Rust unit tests
-python3 scripts/parity.py --rust target/release/herdr-bar   # Rust vs Python, end to end
-PYTHONPATH=src python3 -m unittest discover -s tests -t .   # no deps
+cargo test --release                            # everything below, in one go
+HERDR_BAR_PARITY_ONLY=bar-rename cargo test --test parity   # one parity scenario
+HERDR_BAR_PARITY_BLESS=1 cargo test --test parity           # accept an intended UI change
 bin/herdr-bar --doctor                          # environment diagnostics
 bin/herdr-bar --list                            # the rows, as JSON
-python3 scripts/demo.py                         # run against fixture data
-python3 scripts/demo.py --frame --plain         # print one static frame
-ruff check .                                    # lint, if you have it
 ```
 
-`scripts/demo.py` needs no herdr server, which makes it the fastest way to work
-on the UI. `herdr plugin log list --plugin herdr-bar` shows what herdr
-recorded when it launched the plugin.
+The bar started as a Python package, and the tests keep the Rust port to what
+that release did. Besides the unit tests, `src/probe.rs` replays about 19,000
+answers the Python functions gave (`tests/data/fuzz-corpus.jsonl`), and on
+Linux and macOS `tests/parity.rs` drives the binary on a pseudo-terminal
+against a fake herdr. It compares every screen, the bytes each repaint costs,
+every herdr request and every state file with transcripts recorded from the
+Python release (`tests/parity/golden.json`). None of it needs a herdr server.
+When a UI change is intended, bless the golden and review its diff.
+`herdr plugin log list --plugin herdr-bar` shows what herdr recorded when it
+launched the plugin.
 
 ## Goes well with
 

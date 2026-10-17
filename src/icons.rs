@@ -143,3 +143,111 @@ pub fn logo_for(agent: Option<&str>) -> Option<char> {
     };
     VENDORS.iter().position(|v| *v == kind).map(logo)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::items::{Item, ItemInit, KIND_AGENT};
+    use crate::render::{render_row, Row};
+    use crate::textutil::{strip_ansi, visible_width};
+    use crate::theme::Theme;
+    use std::collections::BTreeMap;
+
+    fn s(text: &str) -> Value {
+        Value::Str(text.into())
+    }
+
+    fn agent_item(agent: &str, agent_name: Option<&str>) -> Item {
+        Item::new(ItemInit {
+            kind: KIND_AGENT,
+            key: "agent:1".into(),
+            title: "Fix search".into(),
+            detail: String::new(),
+            subtitle: String::new(),
+            workspace_id: String::new(),
+            workspace_label: String::new(),
+            tab_id: None,
+            pane_id: None,
+            agent: Some(agent.into()),
+            agent_name: agent_name.map(Into::into),
+            status: "none".into(),
+            tab_number: None,
+            focused: false,
+            extra_terms: Vec::new(),
+        })
+    }
+
+    fn row(field_positions: BTreeMap<usize, Vec<usize>>) -> Row {
+        Row { item: 0, positions: Vec::new(), field_positions }
+    }
+
+    #[test]
+    fn auto_falls_back_without_font() {
+        // The detection result is cached per thread; seed it instead of
+        // probing this machine's fonts.
+        FONT.with(|f| f.set(Some(false)));
+        assert!(!enabled(&s("auto")));
+        assert!(enabled(&s("font")));
+        FONT.with(|f| f.set(Some(true)));
+        assert!(enabled(&s("auto")));
+        assert!(!enabled(&s("none")));
+        assert!(!enabled(&s("invalid")));
+        clear_font_cache();
+    }
+
+    #[test]
+    fn aliases_and_unknown_agents() {
+        assert_eq!(logo_for(Some("Codex")), Some('\u{e1a1}'));
+        assert_eq!(logo_for(Some("Claude Code")), Some('\u{e1a0}'));
+        assert_eq!(logo_for(Some("cursor-agent")), logo_for(Some("cursor")));
+        assert_eq!(logo_for(Some("open-code")), logo_for(Some("opencode")));
+        assert_eq!(logo_for(Some("codex:model")), logo_for(Some("codex")));
+        assert_eq!(logo_for(Some("unrecognised")), None);
+        assert_eq!(logo_for(None), None);
+    }
+
+    #[test]
+    fn logos_preserve_width_and_name_highlights() {
+        let item = agent_item("codex", Some("helper"));
+        let helper = item.fields.iter().position(|f| f == "helper").unwrap();
+        let row = row(BTreeMap::from([(helper, vec![0, 1])]));
+        let mut theme = Theme::new(None, Some(&s("237")), None);
+        theme.agent_icons = true;
+        for width in [24, 46, 80, 120] {
+            for selected in [true, false] {
+                let rendered = render_row(&theme, &item, &row, width, selected, false, None);
+                assert_eq!(visible_width(&rendered) as isize, width);
+            }
+        }
+        let rendered = render_row(&theme, &item, &row, 80, true, false, None);
+        assert!(strip_ansi(&rendered).starts_with("▌ \u{e1a1} "));
+        assert!(strip_ansi(&rendered).contains("@helper"));
+        assert!(rendered.contains("\x1b[4m"));
+        theme.agent_icons = false;
+        let plain = strip_ansi(&render_row(&theme, &item, &row, 80, false, false, None));
+        assert!(!plain.contains('\u{e1a1}'));
+        assert!(plain.contains("@helper"));
+    }
+
+    #[test]
+    fn leading_logo_replaces_vendor_label_even_on_narrow_rows() {
+        let mut theme = Theme::new(None, None, None);
+        theme.agent_icons = true;
+        for agent in ["codex", "claude", "pi", "grok", "kimi", "unrecognised"] {
+            let item = agent_item(agent, None);
+            for width in [24, 46, 80] {
+                let plain = strip_ansi(&render_row(&theme, &item, &row(BTreeMap::new()), width, false, false, None));
+                assert_eq!(visible_width(&plain) as isize, width);
+                if let Some(logo) = logo_for(Some(agent)) {
+                    assert!(plain.starts_with(&format!("  {} ", logo)), "{:?}", plain);
+                    assert!(!plain.contains(agent), "{:?}", plain);
+                } else if width == 80 {
+                    assert!(plain.contains(agent));
+                }
+            }
+        }
+        theme.agent_icons = false;
+        let item = agent_item("codex", None);
+        assert!(strip_ansi(&render_row(&theme, &item, &row(BTreeMap::new()), 80, false, false, None)).contains("codex"));
+    }
+}

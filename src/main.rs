@@ -17,7 +17,7 @@ mod opener;
 mod paint;
 mod par;
 mod proc;
-#[cfg(feature = "probe")]
+#[cfg(all(test, unix))]
 mod probe;
 mod pyjson;
 mod pyos;
@@ -28,6 +28,8 @@ mod sequences;
 mod sha256;
 mod tab_status;
 mod term;
+#[cfg(test)]
+mod testutil;
 mod textutil;
 mod theme;
 mod title_watcher;
@@ -35,10 +37,6 @@ mod unicode_tables;
 
 fn main() {
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
-    #[cfg(feature = "probe")]
-    if args == ["--probe"] {
-        std::process::exit(probe::run());
-    }
     let code = if args == ["--open"] {
         // The Windows open action only runs the Herdr CLI.
         opener::open_bar()

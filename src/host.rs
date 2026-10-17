@@ -424,3 +424,97 @@ pub fn process_age(pid: i128) -> Option<f64> {
     Some(((value(now) - value(created)) as f64 / 1e7).max(0.0))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::TempDir;
+    use std::fs::OpenOptions;
+    use std::time::{Duration, Instant};
+
+    fn open(path: &std::path::Path) -> File {
+        OpenOptions::new().append(true).create(true).open(path).unwrap()
+    }
+
+    #[test]
+    fn second_handle_is_refused_until_the_first_lets_go() {
+        let temp = TempDir::new();
+        let path = temp.path().join("singleton.lock");
+        {
+            let (first, second) = (open(&path), open(&path));
+            lock(&first, false).unwrap();
+            assert!(is_busy(&lock(&second, false).unwrap_err()));
+            unlock(&first);
+            lock(&second, false).unwrap();
+        }
+        // Closing released it. A child that another test forks meanwhile holds
+        // a copy of every descriptor until its exec closes them, so allow a moment.
+        let third = open(&path);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while let Err(error) = lock(&third, false) {
+            assert!(is_busy(&error) && Instant::now() < deadline, "{}", error);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn blocking_lock_waits_for_the_holder() {
+        let temp = TempDir::new();
+        let path = temp.path().join("singleton.lock");
+        let (held, is_held) = std::sync::mpsc::channel();
+        let holder_path = path.clone();
+        let holder = std::thread::spawn(move || {
+            let file = open(&holder_path);
+            lock(&file, false).unwrap();
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        is_held.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        let waiter = open(&path);
+        lock(&waiter, true).unwrap();
+        assert!(started.elapsed() > Duration::from_millis(100));
+        holder.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_options_detach_from_the_popup() {
+        use std::os::unix::io::AsRawFd;
+        let temp = TempDir::new();
+        let file = open(&temp.path().join("singleton.lock"));
+        let fd = file.as_raw_fd();
+        // The worker sees the lock descriptor under the same number.
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(format!("[ -e /dev/fd/{} ] || exit 3; read line", fd));
+        command.stdin(std::process::Stdio::piped());
+        detach(&mut command, &file);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        // A session of its own: it leads it.
+        let session = unsafe { libc::getsid(pid) };
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(b"done\n").unwrap();
+        }
+        let status = child.wait().unwrap();
+        assert_eq!(session, pid);
+        assert!(status.success(), "{:?}", status);
+    }
+
+    #[test]
+    fn pipe_name_is_the_socket_path_under_the_pipe_namespace() {
+        let path = r"C:\Users\me\AppData\Roaming\herdr\herdr.sock";
+        assert_eq!(pipe_name(path), format!("{}{}", r"\\.\pipe\", path));
+        assert_eq!(pipe_name(&pipe_name(path)), pipe_name(path));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn own_process_has_an_age_and_a_missing_pid_has_none() {
+        let age = process_age(std::process::id() as i128).unwrap();
+        assert!((0.0..24.0 * 3600.0).contains(&age));
+        assert!(process_age(0x7FFFFFF1).is_none());
+    }
+}

@@ -1,0 +1,271 @@
+{
+ "pane_ages": {
+  "w1:p1": 356400,
+  "w1:p2": 47.0,
+  "w1:p3": 720.0,
+  "w1:p4": 7440.0,
+  "w1:p5": 13260.0,
+  "w1:p6": 93600.0,
+  "w1:p7": 93600.0,
+  "w2:p1": 480.0,
+  "w2:p2": 3300.0
+ },
+ "preview_text": "● Ready · pacebeats\n  Capacity: 0/32 · new sessions run in an isolated worktree\n\n> the cards still read as meaningless, can you look at the copy?\n\n⏺ Reading src/components/WeekCards.tsx …\n  Found 3 call sites that render the summary string.\n",
+ "snapshot": {
+  "agents": [
+   {
+    "agent": "claude",
+    "agent_status": "working",
+    "cwd": "/Users/dev/workspace/pacebeats",
+    "focused": false,
+    "pane_id": "w1:p2",
+    "tab_id": "w1:t2",
+    "terminal_title_stripped": "Redesign week loading screen",
+    "title": "Start server for viewing",
+    "workspace_id": "w1"
+   },
+   {
+    "agent": "claude",
+    "agent_status": "working",
+    "cwd": "/Users/dev/workspace/pacebeats",
+    "focused": true,
+    "pane_id": "w1:p3",
+    "tab_id": "w1:t3",
+    "terminal_title_stripped": "Check weekly explanation display",
+    "workspace_id": "w1"
+   },
+   {
+    "agent": "codex",
+    "agent_status": "blocked",
+    "cwd": "/Users/dev/workspace/pacebeats/web",
+    "focused": false,
+    "pane_id": "w1:p4",
+    "tab_id": "w1:t4",
+    "terminal_title_stripped": "cards meaningless",
+    "workspace_id": "w1"
+   },
+   {
+    "agent": "claude",
+    "agent_status": "done",
+    "cwd": "/Users/dev/workspace/pacebeats/.worktrees/library",
+    "focused": false,
+    "name": "battery",
+    "pane_id": "w1:p5",
+    "tab_id": "w1:t5",
+    "terminal_title_stripped": "library depth battery",
+    "workspace_id": "w1"
+   },
+   {
+    "agent": "codex",
+    "agent_status": "blocked",
+    "cwd": "/Users/dev/workspace/erestor",
+    "focused": false,
+    "pane_id": "w2:p1",
+    "tab_id": "w2:t1",
+    "terminal_title_stripped": "retry queue backoff",
+    "workspace_id": "w2"
+   },
+   {
+    "agent": "gemini",
+    "agent_status": "idle",
+    "cwd": "/Users/dev/workspace/erestor",
+    "focused": false,
+    "pane_id": "w2:p2",
+    "tab_id": "w2:t2",
+    "terminal_title_stripped": "migrations",
+    "workspace_id": "w2"
+   }
+  ],
+  "focused_pane_id": "w1:p3",
+  "focused_tab_id": "w1:t3",
+  "focused_workspace_id": "w1",
+  "layouts": [],
+  "panes": [
+   {
+    "cwd": "/Users/dev/workspace/pacebeats",
+    "focused": false,
+    "label": "web server",
+    "pane_id": "w1:p1",
+    "tab_id": "w1:t1",
+    "workspace_id": "w1"
+   },
+   {
+    "cwd": "/Users/dev/workspace/pacebeats",
+    "focused": false,
+    "label": "server logs",
+    "pane_id": "w1:p7",
+    "tab_id": "w1:t1",
+    "workspace_id": "w1"
+   },
+   {
+    "cwd": "/Users/dev/workspace/pacebeats",
+    "focused": false,
+    "pane_id": "w1:p6",
+    "tab_id": "w1:t6",
+    "workspace_id": "w1"
+   },
+   {
+    "agent": "claude",
+    "agent_status": "working",
+    "cwd": "/Users/dev/workspace/pacebeats",
+    "focused": false,
+    "pane_id": "w1:p2",
+    "tab_id": "w1:t2",
+    "terminal_title_stripped": "Redesign week loading screen",
+    "title": "Start server for viewing",
+    "workspace_id": "w1"
+   },
+   {
+    "agent": "claude",
+    "agent_status": "working",
+    "cwd": "/Users/dev/workspace/pacebeats",
+    "focused": true,
+    "pane_id": "w1:p3",
+    "tab_id": "w1:t3",
+    "terminal_title_stripped": "Check weekly explanation display",
+    "workspace_id": "w1"
+   },
+   {
+    "agent": "codex",
+    "agent_status": "blocked",
+    "cwd": "/Users/dev/workspace/pacebeats/web",
+    "focused": false,
+    "pane_id": "w1:p4",
+    "tab_id": "w1:t4",
+    "terminal_title_stripped": "cards meaningless",
+    "workspace_id": "w1"
+   },
+   {
+    "agent": "claude",
+    "agent_status": "done",
+    "cwd": "/Users/dev/workspace/pacebeats/.worktrees/library",
+    "focused": false,
+    "pane_id": "w1:p5",
+    "tab_id": "w1:t5",
+    "terminal_title_stripped": "library depth battery",
+    "workspace_id": "w1"
+   },
+   {
+    "agent": "codex",
+    "agent_status": "blocked",
+    "cwd": "/Users/dev/workspace/erestor",
+    "focused": false,
+    "pane_id": "w2:p1",
+    "tab_id": "w2:t1",
+    "terminal_title_stripped": "retry queue backoff",
+    "workspace_id": "w2"
+   },
+   {
+    "agent": "gemini",
+    "agent_status": "idle",
+    "cwd": "/Users/dev/workspace/erestor",
+    "focused": false,
+    "pane_id": "w2:p2",
+    "tab_id": "w2:t2",
+    "terminal_title_stripped": "migrations",
+    "workspace_id": "w2"
+   }
+  ],
+  "protocol": 18,
+  "tabs": [
+   {
+    "agent_status": "none",
+    "focused": false,
+    "label": "server",
+    "number": 1,
+    "pane_count": 2,
+    "tab_id": "w1:t1",
+    "workspace_id": "w1"
+   },
+   {
+    "agent_status": "working",
+    "focused": false,
+    "label": "Redesign week loading screen",
+    "number": 2,
+    "pane_count": 1,
+    "tab_id": "w1:t2",
+    "workspace_id": "w1"
+   },
+   {
+    "agent_status": "working",
+    "focused": true,
+    "label": "Check weekly explanation display",
+    "number": 3,
+    "pane_count": 1,
+    "tab_id": "w1:t3",
+    "workspace_id": "w1"
+   },
+   {
+    "agent_status": "blocked",
+    "focused": false,
+    "label": "cards meaningless",
+    "number": 4,
+    "pane_count": 1,
+    "tab_id": "w1:t4",
+    "workspace_id": "w1"
+   },
+   {
+    "agent_status": "done",
+    "focused": false,
+    "label": "library depth battery",
+    "number": 5,
+    "pane_count": 1,
+    "tab_id": "w1:t5",
+    "workspace_id": "w1"
+   },
+   {
+    "agent_status": "none",
+    "focused": false,
+    "label": "logs",
+    "number": 6,
+    "pane_count": 1,
+    "tab_id": "w1:t6",
+    "workspace_id": "w1"
+   },
+   {
+    "agent_status": "blocked",
+    "focused": false,
+    "label": "retry queue backoff",
+    "number": 1,
+    "pane_count": 1,
+    "tab_id": "w2:t1",
+    "workspace_id": "w2"
+   },
+   {
+    "agent_status": "idle",
+    "focused": false,
+    "label": "migrations",
+    "number": 2,
+    "pane_count": 1,
+    "tab_id": "w2:t2",
+    "workspace_id": "w2"
+   }
+  ],
+  "version": "0.7.5",
+  "workspaces": [
+   {
+    "active_tab_id": "w1:t3",
+    "agent_status": "working",
+    "focused": true,
+    "label": "pacebeats",
+    "number": 1,
+    "pane_count": 7,
+    "tab_count": 6,
+    "workspace_id": "w1"
+   },
+   {
+    "active_tab_id": "w2:t1",
+    "agent_status": "blocked",
+    "focused": false,
+    "label": "erestor",
+    "number": 2,
+    "pane_count": 2,
+    "tab_count": 2,
+    "workspace_id": "w2",
+    "worktree": {
+     "branch": "feat/retry-queue"
+    }
+   }
+  ]
+ }
+}

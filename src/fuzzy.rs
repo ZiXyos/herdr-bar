@@ -288,4 +288,62 @@ mod tests {
         assert_eq!(match_text("ws", "weekly sync").unwrap().positions, vec![0, 7]);
         assert_eq!(split_query("a 'b c' d"), vec!["a", "b c", "d"]);
     }
+
+    // Ported from the Python release's tests/test_fuzzy.py.
+
+    #[test]
+    fn splits_on_whitespace() { assert_eq!(split_query("tri  week"), vec!["tri", "week"]); }
+
+    #[test]
+    fn keeps_quoted_phrases_together() { assert_eq!(split_query("\"week gen\" tri"), vec!["week gen", "tri"]); }
+
+    #[test]
+    fn empty_query_has_no_terms() { assert!(split_query("   ").is_empty()); }
+
+    #[test]
+    fn returns_none_when_characters_are_missing() { assert!(match_text("xyz", "week generation").is_none()); }
+
+    #[test]
+    fn returns_none_when_order_does_not_hold() { assert!(match_text("kew", "week").is_none()); }
+
+    #[test]
+    fn positions_point_at_the_matched_characters() {
+        let text = "Redesign week loading";
+        let found = match_text("week", text).unwrap();
+        let chars: Vec<char> = text.chars().collect();
+        assert_eq!(found.positions.iter().map(|&i| chars[i]).collect::<String>(), "week");
+    }
+
+    #[test]
+    fn prefix_beats_a_later_match() {
+        assert!(match_text("log", "logs").unwrap().score > match_text("log", "the catalog").unwrap().score);
+    }
+
+    #[test]
+    fn word_boundary_beats_mid_word() {
+        assert!(match_text("wg", "week gen").unwrap().score > match_text("wg", "weekgen").unwrap().score);
+    }
+
+    #[test]
+    fn consecutive_beats_scattered() {
+        assert!(match_text("week", "week").unwrap().score > match_text("week", "w e e k").unwrap().score);
+    }
+
+    #[test]
+    fn smart_case_is_insensitive_for_lowercase_queries() { assert!(match_text("rc", "RC").is_some()); }
+
+    #[test]
+    fn smart_case_is_sensitive_once_the_query_has_uppercase() {
+        assert!(match_text("RC", "rc").is_none());
+        assert!(match_text("RC", "RC").is_some());
+    }
+
+    #[test]
+    fn empty_query_matches_with_no_positions() {
+        assert!(match_text("", "anything").unwrap().positions.is_empty());
+    }
+
+    #[test]
+    fn single_character_query() { assert_eq!(match_text("k", "week").unwrap().positions, vec![3]); }
 }
+

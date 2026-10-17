@@ -1,14 +1,17 @@
-//! Differential probe: calls pure functions by name for scripts/fuzz_parity.py.
+//! The Python release's answers, replayed against the port.
 //!
-//! Built only with `--features probe`. Each stdin line is a JSON array, the
-//! function's name followed by its arguments; each stdout line is the result
-//! as JSON, shaped the way the fuzzer shapes the Python function's result.
+//! `tests/data/fuzz-corpus.jsonl` holds one case per line: a function name,
+//! its arguments, and what the Python release returned for them, shaped as
+//! JSON. The inputs are the ones the old differential fuzzer generated with
+//! seed 1, recorded once with Python 3.13 (Unicode 15.1, the release
+//! `src/unicode_tables.rs` comes from) and `HOME=/home/fuzz`. Inputs the
+//! Python functions raised on were left out. `call` runs the Rust port of
+//! each function and shapes its result the same way. Test builds only.
 
 use crate::keys::{Event, KeyDecoder, MouseKind};
 use crate::paint::Painter;
 use crate::pyjson::{self, Map, Value};
 use crate::{age, auto_title, fuzzy, items, pystr, renaming_guard, sequences, tab_status, textutil, theme};
-use std::io::{BufRead, Write};
 
 fn s(value: &Value) -> &str {
     value.as_str().unwrap_or("")
@@ -219,19 +222,42 @@ fn call(name: &str, args: &[Value]) -> Value {
     }
 }
 
-pub fn run() -> i32 {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        let request = pyjson::loads(&line).unwrap_or(Value::Null);
-        let parts = request.list_or_empty();
-        let result = match parts.first() {
-            Some(Value::Str(name)) => call(name, &parts[1..]),
-            _ => Value::str("bad request"),
-        };
-        let _ = writeln!(stdout, "{}", pyjson::dumps(&result, false));
-        let _ = stdout.flush();
+#[cfg(unix)]
+#[test]
+fn python_answers() {
+    // Paths shorten against HOME, and the corpus was recorded with this one.
+    let _env = crate::testutil::env_lock();
+    let mut vars = crate::testutil::EnvVars::new();
+    vars.set("HOME", "/home/fuzz");
+    for key in ["HERDR_SOCKET_PATH", "HERDR_PLUGIN_CONFIG_DIR", "HERDR_PLUGIN_STATE_DIR", "HERDR_PLUGIN_ROOT", "HERDR_BIN_PATH"] {
+        vars.remove(key);
     }
-    0
+    let mut cases = 0;
+    let mut failures = Vec::new();
+    for (index, line) in include_str!("../tests/data/fuzz-corpus.jsonl").lines().enumerate() {
+        let case = pyjson::loads(line).expect("corpus line parses");
+        let parts = case.list_or_empty();
+        let name = parts[0].as_str().expect("case name");
+        let expected = pyjson::dumps(&parts[2], true);
+        let actual = pyjson::dumps(&call(name, parts[1].list_or_empty()), true);
+        cases += 1;
+        if actual != expected {
+            failures.push(format!(
+                "line {} {}\n    args   {}\n    python {}\n    rust   {}",
+                index + 1,
+                name,
+                pyjson::dumps(&parts[1], false),
+                expected,
+                actual
+            ));
+        }
+    }
+    assert!(cases > 19_000, "the corpus has only {} cases", cases);
+    assert!(
+        failures.is_empty(),
+        "{} of {} cases differ from Python:\n{}",
+        failures.len(),
+        cases,
+        failures.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
+    );
 }

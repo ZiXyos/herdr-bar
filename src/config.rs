@@ -131,3 +131,25 @@ impl Config {
         workspace_count > 1
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with(key: &str, value: &str) -> Config {
+        Config::from_values(pyjson::loads(&format!(r#"{{"{}": {}}}"#, key, value)).unwrap().as_dict().unwrap())
+    }
+
+    #[test]
+    fn defaults_and_bad_values() {
+        assert!(!Config::default().tab_status);
+        assert!(Config::default().auto_titles);
+        let pick = |config: &Config, key: &str| if key == "tab_status" { config.tab_status } else { config.auto_titles };
+        for key in ["tab_status", "auto_titles"] {
+            assert!(pick(&with(key, "true"), key), "{}", key);
+            for value in ["false", "\"true\"", "1", "null"] {
+                assert!(!pick(&with(key, value), key), "{} = {}", key, value);
+            }
+        }
+    }
+}

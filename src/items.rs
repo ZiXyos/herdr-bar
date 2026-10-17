@@ -564,3 +564,203 @@ pub fn build_pane_items(snapshot: &Value) -> Vec<Item> {
         items
     })
 }
+
+#[cfg(test)]
+mod tests {
+    // Ported from the Python release's tests/test_items.py.
+    use super::*;
+    use crate::testutil;
+
+    fn items() -> Vec<Item> {
+        build_items(&testutil::snapshot())
+    }
+
+    fn by_kind(items: &[Item], kind: &str) -> Vec<Item> {
+        items.iter().filter(|i| i.kind == kind).cloned().collect()
+    }
+
+    fn pane(items: &[Item], id: &str) -> Item {
+        items.iter().find(|i| i.pane_id.as_deref() == Some(id)).cloned().expect("pane row")
+    }
+
+    /// `snapshot[list][index][key] = value`.
+    fn set(snapshot: &mut Value, list: &str, index: usize, key: &str, value: Value) {
+        let Some(Value::List(rows)) = snapshot.as_dict_mut().unwrap().get_mut(list) else {
+            panic!("no list {list}");
+        };
+        rows[index].as_dict_mut().unwrap().insert(key, value);
+    }
+
+    #[test]
+    fn one_row_per_agent() {
+        assert_eq!(by_kind(&items(), KIND_AGENT).len(), 6);
+    }
+
+    #[test]
+    fn only_tabs_without_agents_become_tab_rows() {
+        let mut titles: Vec<String> = by_kind(&items(), KIND_TAB).into_iter().map(|i| i.title).collect();
+        titles.sort();
+        assert_eq!(titles, vec!["logs", "server"]);
+    }
+
+    #[test]
+    fn workspaces_appear_when_there_is_more_than_one() {
+        assert_eq!(by_kind(&items(), KIND_SPACE).len(), 2);
+    }
+
+    #[test]
+    fn single_workspace_sessions_have_no_space_rows() {
+        let mut snapshot = testutil::snapshot();
+        if let Some(Value::List(spaces)) = snapshot.as_dict_mut().unwrap().get_mut("workspaces") {
+            spaces.truncate(1);
+        }
+        assert!(by_kind(&build_items(&snapshot), KIND_SPACE).is_empty());
+    }
+
+    #[test]
+    fn agent_rows_carry_pane_and_tab_ids() {
+        let agent = items().into_iter().find(|i| i.title == "cards meaningless").unwrap();
+        assert_eq!(agent.pane_id.as_deref(), Some("w1:p4"));
+        assert_eq!(agent.tab_id.as_deref(), Some("w1:t4"));
+        assert_eq!(agent.agent.as_deref(), Some("codex"));
+        assert_eq!(agent.status, "blocked");
+        assert_eq!(agent.tab_number, Some(4));
+    }
+
+    #[test]
+    fn agent_rows_lead_with_the_tab_name_and_trail_the_summary() {
+        let agent = pane(&items(), "w1:p2");
+        assert_eq!(agent.title, "Redesign week loading screen");
+        assert_eq!(agent.detail, "Start server for viewing");
+        assert!(agent.fields.iter().any(|f| f == "Start server for viewing"));
+    }
+
+    #[test]
+    fn summary_stands_alone_when_the_tab_has_no_name() {
+        let mut snapshot = testutil::snapshot();
+        set(&mut snapshot, "tabs", 1, "label", Value::str(""));
+        let agent = pane(&build_items(&snapshot), "w1:p2");
+        assert_eq!(agent.title, "Start server for viewing");
+        assert_eq!(agent.detail, "");
+    }
+
+    #[test]
+    fn summary_is_dropped_when_it_repeats_the_tab_name() {
+        let agent = pane(&items(), "w1:p4");
+        assert_eq!(agent.title, "cards meaningless");
+        assert_eq!(agent.detail, "");
+    }
+
+    #[test]
+    fn focused_pane_marks_exactly_one_row() {
+        let focused: Vec<Item> = items().into_iter().filter(|i| i.focused && i.kind != KIND_SPACE).collect();
+        assert_eq!(focused.len(), 1);
+        assert_eq!(focused[0].pane_id.as_deref(), Some("w1:p3"));
+    }
+
+    #[test]
+    fn project_suffix_does_not_repeat_title() {
+        let mut snapshot = pyjson::loads(
+            r#"{"workspaces": [{"workspace_id": "w1", "label": "Tools"}],
+                "tabs": [{"tab_id": "t1", "workspace_id": "w1", "label": "Fix search"}],
+                "panes": [{"pane_id": "p1", "tab_id": "t1", "cwd": "/work/herdr-bar/"}],
+                "agents": [{"pane_id": "p1", "tab_id": "t1", "agent": "codex"}]}"#,
+        )
+        .unwrap();
+        for (summary, expected) in [
+            ("Fix search | herdr-bar", ""),
+            ("FIX  SEARCH | Tools", ""),
+            ("Fix search | investigate indexing", "Fix search | investigate indexing"),
+            ("Fix search results | herdr-bar", "Fix search results | herdr-bar"),
+            ("Investigate indexing | herdr-bar", "Investigate indexing | herdr-bar"),
+        ] {
+            set(&mut snapshot, "panes", 0, "title", Value::str(summary));
+            let item = by_kind(&build_items(&snapshot), KIND_AGENT).remove(0);
+            assert_eq!(item.detail, expected, "summary {summary:?}");
+            assert_eq!(item.title, "Fix search", "summary {summary:?}");
+        }
+    }
+
+    #[test]
+    fn named_agents_keep_their_name() {
+        let named = items().into_iter().find(|i| i.agent_name.as_deref().is_some_and(|n| !n.is_empty())).unwrap();
+        assert_eq!(named.agent_name.as_deref(), Some("battery"));
+        assert!(named.fields.iter().any(|f| f == "battery"));
+    }
+
+    #[test]
+    fn fields_start_with_the_title_and_have_no_blanks() {
+        for item in items() {
+            assert_eq!(item.fields[0], item.title);
+            assert!(item.fields.iter().all(|f| !f.is_empty()), "{:?}", item.fields);
+        }
+    }
+
+    #[test]
+    fn status_ranking_puts_blocked_first() {
+        let rank = |status: &str| items().into_iter().find(|i| i.status == status).unwrap().status_rank();
+        assert!(rank("blocked") < rank("done"));
+        assert!(rank("done") < rank("working"));
+        assert!(rank("working") < rank("idle"));
+    }
+
+    #[test]
+    fn missing_records_do_not_raise() {
+        assert!(build_items(&pyjson::loads("{}").unwrap()).is_empty());
+        assert!(build_items(&pyjson::loads(r#"{"tabs": [{}], "agents": [{}]}"#).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn pane_rows_lead_with_their_names() {
+        let named = pane(&build_pane_items(&testutil::snapshot()), "w1:p7");
+        assert_eq!(named.kind, KIND_PANE);
+        assert_eq!(named.title, "server logs");
+        assert_eq!(named.detail, "server");
+        assert_eq!(named.key, "pane:w1:p7");
+    }
+
+    #[test]
+    fn unnamed_panes_do_not_get_rows() {
+        let mut ids: Vec<String> =
+            build_pane_items(&testutil::snapshot()).into_iter().filter_map(|i| i.pane_id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["w1:p1", "w1:p7"]);
+    }
+
+    #[test]
+    fn a_named_focused_pane_is_marked() {
+        let mut snapshot = testutil::snapshot();
+        snapshot.as_dict_mut().unwrap().insert("focused_pane_id", Value::str("w1:p7"));
+        let focused: Vec<String> =
+            build_pane_items(&snapshot).into_iter().filter(|i| i.focused).filter_map(|i| i.pane_id).collect();
+        assert_eq!(focused, vec!["w1:p7"]);
+    }
+
+    #[test]
+    fn control_characters_are_stripped_from_titles() {
+        let mut snapshot = testutil::snapshot();
+        set(&mut snapshot, "tabs", 0, "label", Value::str("ser\x1b[31mver\x07"));
+        let title = build_items(&snapshot).into_iter().find(|i| i.tab_id.as_deref() == Some("w1:t1")).unwrap().title;
+        assert!(!title.contains('\x1b'));
+        assert!(!title.contains('\x07'));
+    }
+
+    #[test]
+    fn replaces_home_with_tilde() {
+        let _env = testutil::env_lock();
+        let home = pyos::home().expect("home");
+        assert_eq!(shorten_path(&format!("{home}/code")), "~/code");
+    }
+
+    #[test]
+    fn leaves_other_paths_alone() {
+        let _env = testutil::env_lock();
+        assert_eq!(shorten_path("/etc/hosts"), "/etc/hosts");
+    }
+
+    #[test]
+    fn handles_missing_values() {
+        let _env = testutil::env_lock();
+        assert_eq!(shorten_path(""), "");
+    }
+}

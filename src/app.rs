@@ -895,6 +895,18 @@ impl Bar {
     pub fn draw(&mut self, terminal: &mut Terminal) {
         let (width, height) = terminal.size();
         let (width, height) = (width as isize, height as isize);
+        let rows = self.compose(width, height);
+        let payload = self.painter.frame(&rows, width.max(0) as usize, height.max(0) as usize);
+        if !payload.is_empty() {
+            // A frame with nothing to say says nothing: no bytes, no syscall.
+            terminal.write(&payload);
+            terminal.flush();
+        }
+        self.dirty = false;
+    }
+
+    /// The rows of one frame at this size, before painting.
+    fn compose(&mut self, width: isize, height: isize) -> Vec<String> {
         let preview_on = self.preview_enabled && self.config.fits_preview((width - 2).max(0), self.preview_chosen);
         self.preview_showing = preview_on;
         let layout = compute_layout(width, height, preview_on);
@@ -961,14 +973,7 @@ impl Bar {
             }
             rows.push(format!(" {}", self.footer(layout.inner_width)));
         }
-
-        let payload = self.painter.frame(&rows, width.max(0) as usize, height.max(0) as usize);
-        if !payload.is_empty() {
-            // A frame with nothing to say says nothing: no bytes, no syscall.
-            terminal.write(&payload);
-            terminal.flush();
-        }
-        self.dirty = false;
+        rows
     }
 
     /// Forget what is on screen, so the next draw repaints all of it.
@@ -1198,4 +1203,1378 @@ pub fn jump(client: &mut HerdrClient, item: &Item) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::items::ItemInit;
+    #[cfg(unix)]
+    use crate::pyjson;
+    use crate::pyjson::Map;
+    #[cfg(unix)]
+    use crate::testutil;
+
+    fn item_with(fields: &[&str]) -> Item {
+        let get = |i: usize| fields.get(i).map(|s| s.to_string()).unwrap_or_default();
+        Item::new(ItemInit {
+            kind: KIND_TAB,
+            key: "k".into(),
+            title: get(0),
+            detail: get(1),
+            subtitle: get(2),
+            workspace_id: String::new(),
+            workspace_label: get(3),
+            tab_id: None,
+            pane_id: None,
+            agent: None,
+            agent_name: None,
+            status: String::new(),
+            tab_number: None,
+            focused: false,
+            extra_terms: fields.iter().skip(4).map(|s| s.to_string()).collect(),
+        })
+    }
+
+    fn score(terms: &[&str], fields: &[&str]) -> Option<(i64, BTreeMap<usize, Vec<usize>>)> {
+        let item = item_with(fields);
+        assert_eq!(item.fields.len(), fields.len());
+        let terms: Vec<Term> = terms.iter().map(|t| Term::new(t)).collect();
+        let mut memo = Memo::default();
+        score_item(&terms, &item, &mut memo)
+    }
+
+    #[test]
+    fn terms_may_match_different_fields() {
+        assert!(score(&["retry", "codex"], &["retry queue backoff", "erestor", "codex"]).is_some());
+    }
+
+    #[test]
+    fn a_term_matching_nothing_rejects_the_row() {
+        assert!(score(&["nope"], &["retry queue", "erestor"]).is_none());
+    }
+
+    #[test]
+    fn positions_are_keyed_by_the_field_that_won_the_term() {
+        let (_, positions) = score(&["codex"], &["retry queue backoff", "codex"]).unwrap();
+        assert_eq!(positions, BTreeMap::from([(1, vec![0, 1, 2, 3, 4])]));
+    }
+
+    #[test]
+    fn each_term_highlights_its_own_field() {
+        let (_, positions) = score(&["retry", "codex"], &["retry queue", "codex"]).unwrap();
+        assert_eq!(positions.keys().copied().collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[test]
+    fn title_matches_outrank_field_matches() {
+        let (title_hit, _) = score(&["retry"], &["retry queue", "other"]).unwrap();
+        let (field_hit, _) = score(&["retry"], &["something else", "retry"]).unwrap();
+        assert!(title_hit > field_hit);
+    }
+
+    #[test]
+    fn false_hides_the_preview_to_begin_with() {
+        let config = config_of(&[("preview", Value::Bool(false))]);
+        assert!(!config.preview_starts_on());
+        assert!(config.fits_preview(120, true));
+    }
+
+    #[test]
+    fn auto_waits_for_a_wide_popup_unless_asked() {
+        let config = Config::default();
+        assert!(config.preview_starts_on());
+        assert!(!config.fits_preview(88, false));
+        assert!(config.fits_preview(88, true));
+        assert!(config.fits_preview(120, false));
+    }
+
+    #[test]
+    fn true_keeps_the_preview_in_narrower_popups() {
+        let config = config_of(&[("preview", Value::Bool(true))]);
+        assert!(config.preview_starts_on());
+        assert!(config.fits_preview(70, false));
+        assert!(!config.fits_preview(40, false));
+    }
+
+    fn config_of(entries: &[(&str, Value)]) -> Config {
+        let mut map = Map::new();
+        for (key, value) in entries {
+            map.insert(*key, value.clone());
+        }
+        Config::from_values(&map)
+    }
+
+    // -- a fake Herdr ---------------------------------------------------------
+
+    /// What the Python tests' FakeClient held.
+    #[cfg(unix)]
+    struct State {
+        snapshot: Value,
+        calls: Vec<Vec<String>>,
+        fail: bool,
+        close_error: Option<String>,
+        rename_error: Option<String>,
+        /// Panes the fake can date (it reports this test process for them).
+        ages: Value,
+        age_error: bool,
+    }
+
+    #[cfg(unix)]
+    type Shared = std::sync::Arc<std::sync::Mutex<State>>;
+
+    #[cfg(unix)]
+    struct Fake {
+        state: Shared,
+        path: std::path::PathBuf,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    fn s(value: &Value, key: &str) -> String {
+        value.get(key).as_str().unwrap_or("").to_string()
+    }
+
+    #[cfg(unix)]
+    fn ok(result: Map) -> Value {
+        let mut response = Map::new();
+        response.insert("result", Value::Dict(result));
+        Value::Dict(response)
+    }
+
+    #[cfg(unix)]
+    fn err(message: &str) -> Value {
+        let mut error = Map::new();
+        error.insert("message", Value::str(message));
+        let mut response = Map::new();
+        response.insert("error", Value::Dict(error));
+        Value::Dict(response)
+    }
+
+    #[cfg(unix)]
+    fn answer(state: &Shared, request: &Value) -> Value {
+        let mut state = state.lock().unwrap();
+        let params = request.get("params").clone();
+        let method = s(request, "method");
+        let mut result = Map::new();
+        match method.as_str() {
+            "session.snapshot" => {
+                if state.fail {
+                    return err("herdr is not running");
+                }
+                result.insert("snapshot", state.snapshot.clone());
+            }
+            "pane.read" => {
+                state.calls.push(vec!["read".into(), s(&params, "pane_id")]);
+                let mut read = Map::new();
+                read.insert("text", Value::str(testutil::preview_text()));
+                result.insert("read", Value::Dict(read));
+            }
+            "pane.process_info" => {
+                let pane = s(&params, "pane_id");
+                state.calls.push(vec!["age".into(), pane.clone()]);
+                if state.age_error {
+                    return err("herdr is not running");
+                }
+                let mut info = Map::new();
+                if !state.ages.get(&pane).is_null() {
+                    info.insert("shell_pid", Value::Int(std::process::id() as i128));
+                }
+                result.insert("process_info", Value::Dict(info));
+            }
+            "tab.close" => {
+                let tab = s(&params, "tab_id");
+                state.calls.push(vec!["close".into(), tab.clone()]);
+                if let Some(message) = state.close_error.clone() {
+                    return err(&message);
+                }
+                let snapshot = state.snapshot.as_dict_mut().unwrap();
+                for key in ["tabs", "agents", "panes"] {
+                    if let Some(Value::List(records)) = snapshot.get_mut(key) {
+                        records.retain(|record| record.get("tab_id").as_str() != Some(tab.as_str()));
+                    }
+                }
+            }
+            "tab.rename" => {
+                let (tab, label) = (s(&params, "tab_id"), s(&params, "label"));
+                state.calls.push(vec!["rename".into(), tab.clone(), label.clone()]);
+                if let Some(message) = state.rename_error.clone() {
+                    return err(&message);
+                }
+                if let Some(Value::List(tabs)) = state.snapshot.as_dict_mut().unwrap().get_mut("tabs") {
+                    for record in tabs.iter_mut() {
+                        if record.get("tab_id").as_str() == Some(tab.as_str()) {
+                            record.as_dict_mut().unwrap().insert("label", Value::str(label.clone()));
+                        }
+                    }
+                }
+            }
+            "workspace.focus" => state.calls.push(vec!["workspace".into(), s(&params, "workspace_id")]),
+            "tab.focus" => state.calls.push(vec!["tab".into(), s(&params, "tab_id")]),
+            "agent.focus" => state.calls.push(vec!["agent".into(), s(&params, "target")]),
+            "pane.focus" => state.calls.push(vec!["pane".into(), s(&params, "pane_id")]),
+            _ => return err("unknown method"),
+        }
+        ok(result)
+    }
+
+    #[cfg(unix)]
+    impl Fake {
+        fn new(snapshot: Value) -> Fake {
+            use std::io::{BufRead, BufReader, Write};
+            let path = testutil::socket_path();
+            let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind fake herdr");
+            let state: Shared = std::sync::Arc::new(std::sync::Mutex::new(State {
+                snapshot,
+                calls: Vec::new(),
+                fail: false,
+                close_error: None,
+                rename_error: None,
+                ages: testutil::pane_ages(),
+                age_error: false,
+            }));
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (shared, halt) = (state.clone(), stop.clone());
+            let thread = std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    if halt.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(mut conn) = conn else { continue };
+                    let mut line = String::new();
+                    if BufReader::new(&conn).read_line(&mut line).is_err() {
+                        continue;
+                    }
+                    let request = pyjson::loads(&line).unwrap_or(Value::Null);
+                    let mut out = pyjson::dumps(&answer(&shared, &request), false);
+                    out.push('\n');
+                    let _ = conn.write_all(out.as_bytes());
+                }
+            });
+            Fake { state, path, stop, thread: Some(thread) }
+        }
+
+        fn client(&self) -> HerdrClient {
+            let client = HerdrClient::new(Some(self.path.to_string_lossy().into_owned()), 4.0, false);
+            assert!(client.socket_ok());
+            client
+        }
+
+        fn set(&self, change: impl FnOnce(&mut State)) {
+            change(&mut self.state.lock().unwrap());
+        }
+
+        fn calls(&self, kind: &str) -> Vec<Vec<String>> {
+            self.state.lock().unwrap().calls.iter().filter(|c| c[0] == kind).cloned().collect()
+        }
+
+        fn all_calls(&self) -> Vec<Vec<String>> {
+            self.state.lock().unwrap().calls.clone()
+        }
+
+        fn clear_calls(&self) {
+            self.state.lock().unwrap().calls.clear();
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = std::os::unix::net::UnixStream::connect(&self.path);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// The Python tests' `bar()` fixture, plus the fake behind it.
+    #[cfg(unix)]
+    struct T {
+        bar: Bar,
+        fake: Fake,
+        _env: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    fn bar_with(snapshot: Value, config: Config, recents: Recents) -> T {
+        let env = testutil::env_lock();
+        let fake = Fake::new(snapshot);
+        let mut client = fake.client();
+        let pool = client.snapshot().map(|snapshot| Pool::build(&snapshot, &config));
+        let mut bar = Bar::new(client, config, recents, Theme::new(None, None, None));
+        bar.bootstrap(pool, Vec::new()).expect("bootstrap");
+        T { bar, fake, _env: env }
+    }
+
+    #[cfg(unix)]
+    fn bar() -> T {
+        bar_with(testutil::snapshot(), Config::default(), Recents::new(None))
+    }
+
+    #[cfg(unix)]
+    fn titles(bar: &Bar) -> Vec<String> {
+        bar.rows.iter().map(|row| bar.pool[row.item].title.clone()).collect()
+    }
+
+    #[cfg(unix)]
+    fn row_item(bar: &Bar, index: usize) -> &Item {
+        &bar.pool[bar.rows[index].item]
+    }
+
+    #[cfg(unix)]
+    fn name(outcome: Option<Outcome>) -> Option<&'static str> {
+        outcome.map(|o| match o {
+            Outcome::Cancel => "cancel",
+            Outcome::Confirm => "confirm",
+        })
+    }
+
+    #[cfg(unix)]
+    fn press(bar: &mut Bar, keys: &[&[u8]]) -> Option<&'static str> {
+        let mut decoder = KeyDecoder::new();
+        let mut outcome = None;
+        for key in keys {
+            let events = decoder.feed(key);
+            outcome = name(bar.consume(&events)).or(outcome);
+        }
+        outcome
+    }
+
+    #[cfg(unix)]
+    fn escape(bar: &mut Bar) -> Option<&'static str> {
+        let mut decoder = KeyDecoder::new();
+        decoder.feed(b"\x1b");
+        let events = decoder.flush();
+        name(bar.consume(&events))
+    }
+
+    #[cfg(unix)]
+    fn index_of(bar: &Bar, find: impl Fn(&Item) -> bool) -> usize {
+        bar.rows.iter().position(|row| find(&bar.pool[row.item])).expect("row")
+    }
+
+    #[cfg(unix)]
+    fn item_index(bar: &Bar, find: impl Fn(&Item) -> bool) -> usize {
+        bar.items().iter().position(find).expect("item")
+    }
+
+    #[cfg(unix)]
+    const DELETE: &[u8] = b"\x1b[3~";
+
+    // -- FilterTest -------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_query_lists_regular_items_and_named_panes() {
+        let t = bar();
+        assert_eq!(t.bar.rows.len(), t.bar.items().len() + t.bar.pane_items().len());
+        assert!(titles(&t.bar).contains(&"server logs".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typing_filters_the_list() {
+        let mut t = bar();
+        t.bar.set_query("retry".into(), None);
+        assert_eq!(titles(&t.bar)[0], "retry queue backoff");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn everything_search_includes_named_panes() {
+        let mut t = bar();
+        t.bar.set_query("server logs".into(), None);
+        assert_eq!(titles(&t.bar)[0], "server logs");
+        assert_eq!(row_item(&t.bar, 0).kind, KIND_PANE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_current_pane_does_not_replace_the_current_agent_row() {
+        let mut snapshot = testutil::snapshot();
+        if let Some(Value::List(panes)) = snapshot.as_dict_mut().unwrap().get_mut("panes") {
+            let focused = panes.iter_mut().find(|p| p.get("pane_id").as_str() == Some("w1:p3")).unwrap();
+            focused.as_dict_mut().unwrap().insert("label", Value::str("current editor"));
+        }
+        let t = bar_with(snapshot, Config::default(), Recents::new(None));
+        let keys: Vec<&str> = t.bar.rows.iter().map(|row| t.bar.pool[row.item].key.as_str()).collect();
+        assert!(keys.contains(&"w1:p3"));
+        assert!(keys.contains(&"pane:w1:p3"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_reaches_the_working_directory() {
+        let mut t = bar();
+        t.bar.set_query("worktrees".into(), None);
+        assert!(titles(&t.bar).contains(&"library depth battery".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_reaches_the_agent_kind() {
+        let mut t = bar();
+        t.bar.set_query("gemini".into(), None);
+        assert_eq!(titles(&t.bar), vec!["migrations"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terms_are_combined_with_and() {
+        let mut t = bar();
+        t.bar.set_query("cards codex".into(), None);
+        assert_eq!(titles(&t.bar), vec!["cards meaningless"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_row_is_never_first_at_rest() {
+        let t = bar();
+        let current = t.bar.current_key.clone().unwrap();
+        assert_ne!(row_item(&t.bar, 0).key, current);
+        assert!(t.bar.rows.iter().any(|row| t.bar.pool[row.item].key == current));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recents_float_to_the_top() {
+        let mut recents = Recents::new(None);
+        recents.touch("w1:p5", "library depth battery");
+        let t = bar_with(testutil::snapshot(), Config::default(), recents);
+        assert_eq!(titles(&t.bar)[0], "library depth battery");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_row_sits_right_after_the_recents() {
+        let mut recents = Recents::new(None);
+        recents.touch("w1:p5", "");
+        let t = bar_with(testutil::snapshot(), Config::default(), recents);
+        assert_eq!(Some(&row_item(&t.bar, 1).key), t.bar.current_key.as_ref());
+    }
+
+    // -- ScopeTest --------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn sigil_sets_the_scope_without_entering_text() {
+        let mut t = bar();
+        t.bar.insert("@", false);
+        assert_eq!(t.bar.scope, "agent");
+        assert_eq!(t.bar.query, "");
+        assert!(t.bar.rows.iter().all(|row| t.bar.pool[row.item].kind == KIND_AGENT));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_sigil_shows_tabs_without_agents() {
+        let mut t = bar();
+        t.bar.insert("$", false);
+        let mut found = titles(&t.bar);
+        found.sort();
+        assert_eq!(found, vec!["logs", "server"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_sigil_shows_only_named_panes() {
+        let mut t = bar();
+        t.bar.insert("%", false);
+        assert_eq!(t.bar.scope, "pane");
+        assert!(t.bar.rows.iter().all(|row| t.bar.pool[row.item].kind == KIND_PANE));
+        let mut found = titles(&t.bar);
+        found.sort();
+        assert_eq!(found, vec!["server logs", "web server"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn needs_you_sigil_shows_blocked_and_done() {
+        let mut t = bar();
+        t.bar.insert("!", false);
+        assert!(t.bar.rows.iter().all(|row| matches!(t.bar.pool[row.item].status.as_str(), "blocked" | "done")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigil_is_literal_once_a_query_exists() {
+        let mut t = bar();
+        t.bar.insert("a", false);
+        t.bar.insert("@", false);
+        assert_eq!(t.bar.query, "a@");
+        assert_eq!(t.bar.scope, "all");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backspace_on_an_empty_query_clears_the_scope() {
+        let mut t = bar();
+        t.bar.insert("@", false);
+        t.bar.backspace();
+        assert_eq!(t.bar.scope, "all");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tab_cycles_scopes_both_ways() {
+        let mut t = bar();
+        t.bar.cycle_scope(1);
+        assert_eq!(t.bar.scope, "agent");
+        t.bar.cycle_scope(1);
+        assert_eq!(t.bar.scope, "pane");
+        t.bar.cycle_scope(1);
+        assert_eq!(t.bar.scope, "tab");
+        t.bar.cycle_scope(-1);
+        assert_eq!(t.bar.scope, "pane");
+    }
+
+    // -- KeyTest ----------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn arrows_move_the_selection() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"\x1b[B"]);
+        assert_eq!(t.bar.selected, 1);
+        press(&mut t.bar, &[b"\x1b[A"]);
+        assert_eq!(t.bar.selected, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selection_wraps() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"\x1b[A"]);
+        assert_eq!(t.bar.selected, t.bar.rows.len() - 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emacs_movement_keys() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"\x0e\x0e"]);
+        assert_eq!(t.bar.selected, 2);
+        press(&mut t.bar, &[b"\x10"]);
+        assert_eq!(t.bar.selected, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vim_movement_keys() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"\x0a\x0a"]);
+        assert_eq!(t.bar.selected, 2);
+        press(&mut t.bar, &[b"\x0b"]);
+        assert_eq!(t.bar.selected, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typing_and_editing() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"retry"]);
+        assert_eq!(t.bar.query, "retry");
+        press(&mut t.bar, &[b"\x7f"]);
+        assert_eq!(t.bar.query, "retr");
+        press(&mut t.bar, &[b"\x15"]);
+        assert_eq!(t.bar.query, "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_word() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"week gen"]);
+        press(&mut t.bar, &[b"\x17"]);
+        assert_eq!(t.bar.query, "week ");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_editing_inserts_in_place() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"week"]);
+        press(&mut t.bar, &[b"\x1b[D\x1b[D"]);
+        press(&mut t.bar, &[b"X"]);
+        assert_eq!(t.bar.query, "weXek");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enter_confirms_and_escape_cancels() {
+        let mut t = bar();
+        assert_eq!(press(&mut t.bar, &[b"\r"]), Some("confirm"));
+        assert_eq!(escape(&mut t.bar), Some("cancel"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paste_becomes_query_text() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"\x1b[200~retry queue\x1b[201~"]);
+        assert_eq!(t.bar.query, "retry queue");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enter_does_nothing_when_the_list_is_empty() {
+        let mut t = bar();
+        t.bar.set_query("zzzqqq".into(), None);
+        assert_eq!(press(&mut t.bar, &[b"\r"]), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_toggle() {
+        let mut t = bar();
+        let before = t.bar.preview_enabled;
+        press(&mut t.bar, &[b"\x0f"]);
+        assert_ne!(before, t.bar.preview_enabled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_false_is_a_starting_point_not_a_lock() {
+        let mut t = bar_with(testutil::snapshot(), config_of(&[("preview", Value::Bool(false))]), Recents::new(None));
+        assert!(!t.bar.preview_enabled);
+        press(&mut t.bar, &[b"\x0f"]);
+        assert!(t.bar.preview_enabled);
+    }
+
+    // -- MouseTest --------------------------------------------------------------
+
+    #[cfg(unix)]
+    fn mouse_bar() -> T {
+        let mut t = bar();
+        t.bar.list_top = 2;
+        t.bar.list_height = 8;
+        t
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wheel_scrolls_the_selection() {
+        let mut t = mouse_bar();
+        t.bar.handle_mouse(MouseKind::WheelDown, 5);
+        assert_eq!(t.bar.selected, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn click_selects_then_confirms() {
+        let mut t = mouse_bar();
+        assert_eq!(name(t.bar.handle_mouse(MouseKind::Press, 5)), None);
+        assert_eq!(t.bar.selected, 2);
+        assert_eq!(name(t.bar.handle_mouse(MouseKind::Press, 5)), Some("confirm"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clicks_outside_the_list_are_ignored() {
+        let mut t = mouse_bar();
+        assert_eq!(name(t.bar.handle_mouse(MouseKind::Press, 1)), None);
+        assert_eq!(t.bar.selected, 0);
+    }
+
+    // -- RefreshTest ------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn selection_survives_a_refresh() {
+        let mut t = bar();
+        t.bar.selected = 3;
+        let keep = t.bar.selected_item().key.clone();
+        t.bar.refresh(false);
+        assert_eq!(t.bar.selected_item().key, keep);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_server_flashes_instead_of_raising() {
+        let mut t = bar();
+        t.fake.set(|s| s.fail = true);
+        t.bar.refresh(false);
+        assert!(t.bar.status.is_some());
+        assert!(!t.bar.rows.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_rows_disappear() {
+        let mut t = bar();
+        t.fake.set(|s| {
+            if let Some(Value::List(agents)) = s.snapshot.as_dict_mut().unwrap().get_mut("agents") {
+                agents.truncate(1);
+            }
+        });
+        t.bar.refresh(false);
+        assert_eq!(t.bar.rows.iter().filter(|row| t.bar.pool[row.item].kind == KIND_AGENT).count(), 1);
+    }
+
+    // -- JumpTest ---------------------------------------------------------------
+
+    #[cfg(unix)]
+    fn jumped(t: &mut T, index: usize) -> Vec<Vec<String>> {
+        t.fake.clear_calls();
+        let item = t.bar.pool[index].clone();
+        jump(&mut t.bar.client, &item).expect("jump");
+        t.fake.all_calls()
+    }
+
+    #[cfg(unix)]
+    fn call(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_rows_focus_the_tab_and_the_pane() {
+        let mut t = bar();
+        let index = item_index(&t.bar, |i| i.title == "cards meaningless");
+        assert_eq!(jumped(&mut t, index), vec![call(&["tab", "w1:t4"]), call(&["agent", "w1:p4"])]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tab_rows_only_focus_the_tab() {
+        let mut t = bar();
+        let index = item_index(&t.bar, |i| i.kind == KIND_TAB);
+        let tab_id = t.bar.pool[index].tab_id.clone().unwrap();
+        assert_eq!(jumped(&mut t, index), vec![call(&["tab", &tab_id])]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_rows_focus_the_workspace() {
+        let mut t = bar();
+        let index = item_index(&t.bar, |i| i.kind == KIND_SPACE);
+        let workspace_id = t.bar.pool[index].workspace_id.clone();
+        assert_eq!(jumped(&mut t, index), vec![call(&["workspace", &workspace_id])]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_rows_focus_the_tab_and_exact_pane() {
+        let mut t = bar();
+        t.bar.insert("%", false);
+        let row = index_of(&t.bar, |i| i.pane_id.as_deref() == Some("w1:p7"));
+        let index = t.bar.rows[row].item;
+        assert_eq!(jumped(&mut t, index), vec![call(&["tab", "w1:t1"]), call(&["pane", "w1:p7"])]);
+    }
+
+    // -- CloseTest --------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_arms_a_confirmation_instead_of_closing() {
+        let mut t = bar();
+        press(&mut t.bar, &[DELETE]);
+        assert!(t.bar.pending_close.is_some());
+        assert!(t.fake.calls("close").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enter_closes_the_tab_behind_the_row() {
+        let mut t = bar();
+        let tab_id = t.bar.selected_item().tab_id.clone().unwrap();
+        press(&mut t.bar, &[DELETE]);
+        assert_eq!(press(&mut t.bar, &[b"\r"]), None); // confirming is not jumping
+        assert_eq!(t.fake.calls("close"), vec![call(&["close", &tab_id])]);
+        assert!(t.bar.pending_close.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backspace_arms_it_too_once_it_has_nothing_to_erase() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"\x7f"]);
+        assert!(t.bar.pending_close.is_some());
+        assert!(t.bar.backspace_closes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backspace_erases_the_query_before_it_closes_anything() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"week"]);
+        press(&mut t.bar, &[b"\x7f"]);
+        assert_eq!(t.bar.query, "wee");
+        assert!(t.bar.pending_close.is_none());
+        assert!(!t.bar.backspace_closes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backspace_clears_the_filter_before_it_closes_anything() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"@"]);
+        press(&mut t.bar, &[b"\x7f"]);
+        assert_eq!(t.bar.scope, "all");
+        assert!(t.bar.pending_close.is_none());
+        press(&mut t.bar, &[b"\x7f"]);
+        assert!(t.bar.pending_close.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_held_delete_key_cannot_confirm_itself() {
+        let mut t = bar();
+        press(&mut t.bar, &[DELETE, DELETE]);
+        assert!(t.bar.pending_close.is_none());
+        assert!(t.fake.calls("close").is_empty());
+        press(&mut t.bar, &[b"\x7f", b"\x7f"]);
+        assert!(t.bar.pending_close.is_none());
+        assert!(t.fake.calls("close").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn y_confirms_too() {
+        let mut t = bar();
+        press(&mut t.bar, &[DELETE, b"y"]);
+        assert_eq!(t.fake.calls("close").len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escape_cancels_the_close_and_leaves_the_bar_open() {
+        let mut t = bar();
+        press(&mut t.bar, &[DELETE]);
+        assert_eq!(escape(&mut t.bar), None);
+        assert!(t.bar.pending_close.is_none());
+        assert!(t.fake.calls("close").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn any_other_key_cancels_and_is_swallowed() {
+        let mut t = bar();
+        press(&mut t.bar, &[DELETE, b"n"]);
+        assert!(t.bar.pending_close.is_none());
+        assert_eq!(t.bar.query, "");
+        assert!(t.fake.calls("close").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_c_still_leaves() {
+        let mut t = bar();
+        press(&mut t.bar, &[DELETE]);
+        assert_eq!(press(&mut t.bar, &[b"\x03"]), Some("cancel"));
+        assert!(t.bar.pending_close.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_closed_row_disappears() {
+        let mut t = bar();
+        let title = t.bar.selected_item().title.clone();
+        press(&mut t.bar, &[DELETE, b"\r"]);
+        assert!(!titles(&t.bar).contains(&title));
+        assert!(t.bar.selected < t.bar.rows.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_confirmation_counts_the_agents_going_with_the_tab() {
+        let mut snapshot = testutil::snapshot();
+        {
+            let map = snapshot.as_dict_mut().unwrap();
+            let mut second = map.get("agents").unwrap().list_or_empty()[0].clone();
+            let record = second.as_dict_mut().unwrap();
+            record.insert("pane_id", Value::str("w1:p7"));
+            record.insert("terminal_title_stripped", Value::str("second agent"));
+            for key in ["agents", "panes"] {
+                if let Some(Value::List(list)) = map.get_mut(key) {
+                    list.push(second.clone());
+                }
+            }
+        }
+        let mut t = bar_with(snapshot, Config::default(), Recents::new(None));
+        t.bar.selected = index_of(&t.bar, |i| i.pane_id.as_deref() == Some("w1:p7"));
+        press(&mut t.bar, &[DELETE]);
+        let pending = t.bar.pending_close.clone().unwrap();
+        assert_eq!(pending.0, "w1:t2");
+        assert_eq!(pending.2, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_rows_cannot_be_closed() {
+        let mut t = bar();
+        t.bar.selected = index_of(&t.bar, |i| i.kind == KIND_SPACE);
+        press(&mut t.bar, &[DELETE]);
+        assert!(t.bar.pending_close.is_none());
+        assert!(t.bar.status.is_some());
+        assert!(t.fake.calls("close").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_close_flashes_the_reason() {
+        let mut t = bar();
+        t.fake.set(|s| s.close_error = Some("tab is busy".into()));
+        press(&mut t.bar, &[DELETE, b"\r"]);
+        assert!(t.bar.status.as_deref().unwrap_or("").contains("busy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_d_forward_deletes_in_the_query() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"week"]);
+        press(&mut t.bar, &[b"\x1b[D\x1b[D"]);
+        press(&mut t.bar, &[b"\x04"]);
+        assert_eq!(t.bar.query, "wek");
+    }
+
+    // -- RenameTest -------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_r_opens_an_editor_for_the_selected_tabs_name() {
+        let mut t = bar();
+        let selected = t.bar.selected_item().clone();
+        press(&mut t.bar, &[b"\x12"]);
+        assert_eq!(t.bar.pending_rename, Some((selected.tab_id.unwrap(), selected.title)));
+        assert_eq!(t.bar.rename_text, "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enter_renames_the_tab_behind_an_agent_row() {
+        let mut t = bar();
+        let tab_id = t.bar.selected_item().tab_id.clone().unwrap();
+        press(&mut t.bar, &[b"\x12", b"new panel name", b"\r"]);
+        assert_eq!(t.fake.calls("rename"), vec![call(&["rename", &tab_id, "new panel name"])]);
+        assert!(t.bar.pending_rename.is_none());
+        assert!(titles(&t.bar).contains(&"new panel name".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escape_keeps_the_old_name_and_the_bar_open() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"\x12", b"replacement"]);
+        assert_eq!(escape(&mut t.bar), None);
+        assert!(t.bar.pending_rename.is_none());
+        assert!(t.fake.calls("rename").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_enter_keeps_the_old_name() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"\x12", b"\r"]);
+        assert!(t.bar.pending_rename.is_none());
+        assert!(t.fake.calls("rename").is_empty());
+        assert!(t.bar.status.as_deref().unwrap_or("").contains("unchanged"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_editor_supports_cursor_edits_and_paste() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"\x12", b"\x1b[200~panel nme\x1b[201~", b"\x1b[D\x1b[D", b"a", b"\r"]);
+        assert_eq!(t.fake.calls("rename")[0][2], "panel name");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_failure_stays_in_the_editor() {
+        let mut t = bar();
+        t.fake.set(|s| s.rename_error = Some("name rejected".into()));
+        press(&mut t.bar, &[b"\x12", b"bad name", b"\r"]);
+        assert!(t.bar.pending_rename.is_some());
+        assert_eq!(t.bar.rename_text, "bad name");
+        assert!(t.bar.status.as_deref().unwrap_or("").contains("rejected"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_rows_cannot_be_renamed() {
+        let mut t = bar();
+        t.bar.selected = index_of(&t.bar, |i| i.kind == KIND_SPACE);
+        press(&mut t.bar, &[b"\x12"]);
+        assert!(t.bar.pending_rename.is_none());
+        assert!(t.bar.status.as_deref().unwrap_or("").contains("tabs and agents"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_c_during_rename_still_leaves_the_bar() {
+        let mut t = bar();
+        press(&mut t.bar, &[b"\x12"]);
+        assert_eq!(press(&mut t.bar, &[b"\x03"]), Some("cancel"));
+        assert!(t.bar.pending_rename.is_none());
+    }
+
+    // -- AgeTest ----------------------------------------------------------------
+    //
+    // The fake reports this test process for every pane it can date, so a
+    // reading is this process's real age rather than the fixture's number.
+
+    #[cfg(unix)]
+    fn pane_item(bar: &Bar, pane_id: &str) -> usize {
+        item_index(bar, |i| i.pane_id.as_deref() == Some(pane_id))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pane_is_read_once_and_then_ticked_locally() {
+        let mut t = bar();
+        let item = pane_item(&t.bar, "w1:p3");
+        assert_eq!(t.bar.age_of(item), None); // queued, not read yet
+        t.bar.pump_ages();
+        let age = t.bar.age_of(item).expect("dated");
+        assert!(age >= 0.0);
+        t.bar.pump_ages();
+        assert_eq!(t.fake.calls("age"), vec![call(&["age", "w1:p3"])]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_queued_pane_is_read_in_one_pass() {
+        // Python read one pane per pass. The port dates the whole queue at
+        // once, with one `ps` for all of it (commit bc4747f), and never asks
+        // about a pane again.
+        let mut t = bar();
+        for index in 0..t.bar.items().len() {
+            t.bar.age_of(index);
+        }
+        let mut queued = t.bar.age_queue.clone();
+        queued.sort();
+        queued.dedup();
+        assert!(queued.len() > 1);
+        t.bar.pump_ages();
+        assert_eq!(t.fake.calls("age").len(), queued.len());
+        assert!(t.bar.age_queue.is_empty());
+        t.bar.pump_ages();
+        assert_eq!(t.fake.calls("age").len(), queued.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_undatable_pane_is_not_asked_twice() {
+        let mut t = bar();
+        t.fake.set(|s| s.ages = Value::Dict(Map::new()));
+        let item = pane_item(&t.bar, "w1:p3");
+        t.bar.age_of(item);
+        t.bar.pump_ages();
+        assert_eq!(t.bar.age_of(item), None);
+        t.bar.pump_ages();
+        assert_eq!(t.fake.calls("age").len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_read_is_not_fatal() {
+        let mut t = bar();
+        t.fake.set(|s| s.age_error = true);
+        let item = pane_item(&t.bar, "w1:p3");
+        t.bar.age_of(item);
+        t.bar.pump_ages();
+        assert_eq!(t.bar.age_of(item), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_rows_have_no_running_time() {
+        let mut t = bar();
+        let item = item_index(&t.bar, |i| i.kind == KIND_SPACE);
+        assert_eq!(t.bar.age_of(item), None);
+        assert!(t.bar.age_queue.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_time_disabled_skips_the_reading() {
+        let mut t = bar_with(testutil::snapshot(), config_of(&[("running_time", Value::Bool(false))]), Recents::new(None));
+        let item = pane_item(&t.bar, "w1:p3");
+        assert_eq!(t.bar.age_of(item), None);
+        assert!(t.bar.age_queue.is_empty()); // never queued, so ps is never run
+        t.bar.pump_ages();
+        assert!(t.fake.calls("age").is_empty());
+    }
+
+    // -- PreviewTest ------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_is_debounced_then_cached() {
+        let mut t = bar();
+        let item = t.bar.items().iter().position(|i| i.pane_id.is_some()).unwrap();
+        let pane_id = t.bar.pool[item].pane_id.clone().unwrap();
+        let (lines, loading) = t.bar.preview_lines(Some(item));
+        assert!(loading);
+        assert!(lines.is_empty());
+        t.bar.preview_pending = Some((pane_id, 0.0));
+        t.bar.pump_preview(10);
+        let (lines, loading) = t.bar.preview_lines(Some(item));
+        assert!(!loading);
+        assert!(lines.join("\n").contains("Ready"));
+        t.bar.pump_preview(10);
+        assert_eq!(t.fake.calls("read").len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_rows_have_no_preview() {
+        let mut t = bar();
+        let item = item_index(&t.bar, |i| i.kind == KIND_SPACE);
+        let (lines, loading) = t.bar.preview_lines(Some(item));
+        assert!(lines.is_empty());
+        assert!(!loading);
+    }
+
+    // -- frames (tests/test_render.py's draw() helper) -----------------------
+
+    #[cfg(unix)]
+    const SIZES: &[(isize, isize)] =
+        &[(40, 6), (56, 8), (72, 10), (80, 24), (96, 12), (110, 20), (140, 30), (200, 40), (30, 5), (24, 4)];
+
+    /// One draw, then the preview and running times the loop would fetch.
+    #[cfg(unix)]
+    fn settle(bar: &mut Bar, width: isize, height: isize) {
+        bar.compose(width, height);
+        if let Some((pane, _)) = bar.preview_pending.clone() {
+            bar.preview_pending = Some((pane, 0.0)); // skip the debounce
+        }
+        let height = bar.list_height;
+        bar.pump_preview(height);
+        while !bar.age_queue.is_empty() {
+            bar.pump_ages();
+        }
+    }
+
+    #[cfg(unix)]
+    struct Frame {
+        t: T,
+        rows: Vec<String>,
+    }
+
+    #[cfg(unix)]
+    fn frame(width: isize, height: isize, query: &str, scope: &'static str, config: Config, confirm: bool, keys: &[u8]) -> Frame {
+        let mut t = bar_with(testutil::snapshot(), config, Recents::new(None));
+        let icons = t.bar.theme.agent_icons;
+        t.bar.theme = Theme::new(None, Some(&Value::str("237")), None);
+        t.bar.theme.agent_icons = icons;
+        // FakeClient.pane_age answered from PANE_AGES; the fake socket dates
+        // panes by this test process instead, so seed the fixture's readings.
+        if let Value::Dict(ages) = testutil::pane_ages() {
+            for (pane, seconds) in ages.iter() {
+                let seconds = match seconds {
+                    Value::Int(n) => *n as f64,
+                    Value::Float(f) => *f,
+                    _ => continue,
+                };
+                t.bar.ages.insert(pane.clone(), Some((monotonic(), seconds)));
+            }
+        }
+        t.bar.scope = scope;
+        if !query.is_empty() {
+            t.bar.set_query(query.to_string(), None);
+        }
+        t.bar.rebuild(None);
+        settle(&mut t.bar, width, height);
+        if !keys.is_empty() {
+            press(&mut t.bar, &[keys]);
+            settle(&mut t.bar, width, height);
+        }
+        if confirm {
+            t.bar.request_close();
+        }
+        let mut rows = t.bar.compose(width, height);
+        rows.resize(height.max(0) as usize, String::new());
+        Frame { t, rows }
+    }
+
+    #[cfg(unix)]
+    fn default_config() -> Config {
+        config_of(&[("selection_background", Value::str("237"))])
+    }
+
+    #[cfg(unix)]
+    fn draw(width: isize, height: isize, query: &str) -> Frame {
+        frame(width, height, query, "all", default_config(), false, b"")
+    }
+
+    #[cfg(unix)]
+    fn joined(rows: &[String]) -> String {
+        crate::textutil::strip_ansi(&rows.join("\n"))
+    }
+
+    /// Whether `text` has digits, `sep`, then digits (`\d+<sep>\d+`).
+    #[cfg(unix)]
+    fn has_digits_around(text: &str, sep: char) -> bool {
+        let c: Vec<char> = text.chars().collect();
+        (1..c.len().saturating_sub(1)).any(|i| c[i] == sep && c[i - 1].is_ascii_digit() && c[i + 1].is_ascii_digit())
+    }
+
+    /// `\d+h\d\dm`
+    #[cfg(unix)]
+    fn has_hours(text: &str) -> bool {
+        let c: Vec<char> = text.chars().collect();
+        (1..c.len()).any(|i| {
+            c[i] == 'h'
+                && c[i - 1].is_ascii_digit()
+                && c.len() > i + 3
+                && c[i + 1].is_ascii_digit()
+                && c[i + 2].is_ascii_digit()
+                && c[i + 3] == 'm'
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rows_never_exceed_the_popup_width() {
+        for &(width, height) in SIZES {
+            for query in ["", "week", "zzzz"] {
+                let f = draw(width, height, query);
+                for (index, row) in f.rows.iter().enumerate() {
+                    assert!(
+                        crate::textutil::visible_width(row) as isize <= width,
+                        "row {} overflows at {}x{} query={:?}: {:?}",
+                        index, width, height, query, row
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_armed_close_never_overflows_either() {
+        for &(width, height) in SIZES {
+            let f = frame(width, height, "", "all", default_config(), true, b"");
+            for (index, row) in f.rows.iter().enumerate() {
+                assert!(crate::textutil::visible_width(row) as isize <= width, "row {} at {}x{}: {:?}", index, width, height, row);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frame_never_exceeds_the_popup_height() {
+        for &(width, height) in SIZES {
+            let mut t = bar();
+            assert!(t.bar.compose(width, height).len() as isize <= height, "{}x{}", width, height);
+            drop(t);
+            assert_eq!(draw(width, height, "").rows.len() as isize, height);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn query_is_echoed_in_the_input_row() {
+        assert!(draw(110, 20, "week").rows[0].contains("week"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn placeholder_appears_only_when_empty() {
+        assert!(draw(110, 20, "").rows[0].contains("jump to a tab"));
+        assert!(!draw(110, 20, "week").rows[0].contains("jump to a tab"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn top_bar_highlights_the_active_filter() {
+        let accent = Theme::new(None, None, None).fg("accent").to_string();
+        let all = draw(110, 20, "").rows[0].clone();
+        let agent = frame(110, 20, "", "agent", default_config(), false, b"").rows[0].clone();
+        assert!(all.contains(&format!("{} everything ", accent)));
+        assert!(crate::textutil::strip_ansi(&all).contains("everything"));
+        assert!(agent.contains(&format!("{} @ agents ", accent)));
+        assert!(crate::textutil::strip_ansi(&agent).contains("@ agents"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_row_is_marked() {
+        let f = draw(110, 20, "");
+        let body: Vec<&String> = f.rows.iter().filter(|r| r.contains("▌")).collect();
+        assert_eq!(body.len(), 1);
+        let title: String = f.t.bar.selected_item().title.chars().take(12).collect();
+        assert!(body[0].contains(&title));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_shows_pane_output() {
+        assert!(draw(140, 20, "").rows.join("\n").contains("Ready"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_false_hides_the_preview_but_ctrl_o_brings_it_back() {
+        let hidden = || config_of(&[("preview", Value::Bool(false))]);
+        assert!(!frame(140, 20, "", "all", hidden(), false, b"").rows.join("\n").contains("Ready"));
+        assert!(frame(140, 20, "", "all", hidden(), false, b"\x0f").rows.join("\n").contains("Ready"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_o_opens_the_preview_in_a_popup_auto_thinks_is_too_narrow() {
+        assert!(!draw(90, 20, "").rows.join("\n").contains("Ready"));
+        assert!(frame(90, 20, "", "all", default_config(), false, b"\x0f").rows.join("\n").contains("Ready"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_o_hides_a_preview_that_is_showing() {
+        assert!(!frame(140, 20, "", "all", default_config(), false, b"\x0f").rows.join("\n").contains("Ready"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_state_when_nothing_matches() {
+        assert!(draw(110, 20, "zzzqqq").rows.join("\n").contains("no matches"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_filter_shows_its_name_and_named_panes() {
+        let plain = joined(&frame(110, 20, "", "pane", default_config(), false, b"").rows);
+        assert!(plain.contains("% panes"));
+        assert!(plain.contains("server logs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn counter_shows_filtered_over_total() {
+        let f = draw(110, 20, "week");
+        assert!(has_digits_around(f.rows.last().unwrap(), '/'), "{:?}", f.rows.last());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rows_carry_their_running_time() {
+        let plain = joined(&draw(140, 20, "").rows);
+        assert!(has_hours(&plain), "{}", plain);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_footer_names_the_delete_key_that_works() {
+        let empty = crate::textutil::strip_ansi(draw(110, 20, "").rows.last().unwrap());
+        let typed = crate::textutil::strip_ansi(draw(110, 20, "week").rows.last().unwrap());
+        assert!(empty.contains("⌫ close"), "{:?}", empty);
+        assert!(typed.contains("⌦ close"), "{:?}", typed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_armed_close_replaces_the_hints() {
+        let f = frame(110, 20, "", "all", default_config(), true, b"");
+        let footer = crate::textutil::strip_ansi(f.rows.last().unwrap());
+        let title: String = f.t.bar.pending_close.as_ref().expect("armed").1.chars().take(12).collect();
+        assert!(footer.contains("close"));
+        assert!(footer.contains(&title));
+        assert!(!footer.contains("scope"));
+    }
 }

@@ -603,3 +603,245 @@ pub fn sleep(seconds: f64) {
         std::thread::sleep(Duration::from_secs_f64(seconds));
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::testutil::{self, TempDir};
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+    use std::sync::{Arc, Mutex};
+
+    type Requests = Arc<Mutex<Vec<Value>>>;
+
+    /// A stand-in for the Herdr socket: one request per connection. The
+    /// responder's None means "never answer" (the connection stays open).
+    fn serve(path: &std::path::Path, responder: fn(&Value) -> Option<Value>) -> Requests {
+        let listener = UnixListener::bind(path).expect("bind fake herdr socket");
+        let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        std::thread::spawn(move || {
+            let mut stalled = Vec::new();
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut line = String::new();
+                if BufReader::new(&conn).read_line(&mut line).is_err() {
+                    continue;
+                }
+                let Ok(request) = pyjson::loads(&line) else { continue };
+                seen.lock().unwrap().push(request.clone());
+                match responder(&request) {
+                    Some(reply) => {
+                        let _ = conn.write_all(format!("{}\n", pyjson::dumps(&reply, false)).as_bytes());
+                    }
+                    None => stalled.push(conn),
+                }
+            }
+        });
+        requests
+    }
+
+    fn ok(request: &Value) -> Option<Value> {
+        let id = request.get("id").clone();
+        let result = match request.get("method").as_str() {
+            Some("session.snapshot") => {
+                dict(&[("type", Value::str("session_snapshot")), ("snapshot", testutil::snapshot())])
+            }
+            Some("pane.read") => dict(&[
+                ("type", Value::str("pane_read")),
+                ("read", dict(&[("text", Value::str("hello\nworld"))])),
+            ]),
+            _ => dict(&[("type", Value::str("ok"))]),
+        };
+        Some(dict(&[("id", id), ("result", result)]))
+    }
+
+    fn client(socket: &std::path::Path, bin: &str) -> HerdrClient {
+        let mut client = HerdrClient::new(Some(socket.to_string_lossy().into_owned()), 4.0, false);
+        client.bin_path = bin.to_string();
+        client
+    }
+
+    fn params(text: &str) -> Value {
+        pyjson::loads(text).unwrap()
+    }
+
+    #[test]
+    fn snapshot_round_trip() {
+        let _env = testutil::env_lock();
+        let path = testutil::socket_path();
+        let requests = serve(&path, ok);
+        let mut client = client(&path, "/nonexistent");
+        assert!(client.socket_ok());
+        let snapshot = client.snapshot().unwrap();
+        assert_eq!(snapshot.get("tabs").list_or_empty().len(), 8);
+        assert_eq!(requests.lock().unwrap()[0].get("method"), &Value::str("session.snapshot"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pane_read_sends_the_documented_params() {
+        let _env = testutil::env_lock();
+        let path = testutil::socket_path();
+        let requests = serve(&path, ok);
+        let mut client = client(&path, "/nonexistent");
+        assert_eq!(client.read_pane("w1:p1", 12, "visible").unwrap(), "hello\nworld");
+        assert_eq!(
+            requests.lock().unwrap()[0].get("params"),
+            &params(r#"{"pane_id": "w1:p1", "source": "visible", "lines": 12}"#)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn focus_calls_use_the_documented_targets() {
+        let _env = testutil::env_lock();
+        let path = testutil::socket_path();
+        let requests = serve(&path, ok);
+        let mut client = client(&path, "/nonexistent");
+        client.focus_tab("w1:t1").unwrap();
+        client.focus_workspace("w1").unwrap();
+        client.focus_agent("w1:p1").unwrap();
+        client.focus_pane("w1:p2").unwrap();
+        let seen: Vec<(Value, Value)> =
+            requests.lock().unwrap().iter().map(|r| (r.get("method").clone(), r.get("params").clone())).collect();
+        assert_eq!(
+            seen,
+            vec![
+                (Value::str("tab.focus"), params(r#"{"tab_id": "w1:t1"}"#)),
+                (Value::str("workspace.focus"), params(r#"{"workspace_id": "w1"}"#)),
+                (Value::str("agent.focus"), params(r#"{"target": "w1:p1"}"#)),
+                (Value::str("pane.focus"), params(r#"{"pane_id": "w1:p2"}"#)),
+            ]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tab_rename_sends_the_documented_params() {
+        let _env = testutil::env_lock();
+        let path = testutil::socket_path();
+        let requests = serve(&path, ok);
+        let mut client = client(&path, "/nonexistent");
+        client.rename_tab("w1:t1", "new panel name").unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].get("method"), &Value::str("tab.rename"));
+        assert_eq!(requests[0].get("params"), &params(r#"{"tab_id": "w1:t1", "label": "new panel name"}"#));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn server_errors_become_herdr_errors() {
+        fn failing(request: &Value) -> Option<Value> {
+            Some(dict(&[("id", request.get("id").clone()), ("error", params(r#"{"code": "not_found", "message": "no such tab"}"#))]))
+        }
+        let _env = testutil::env_lock();
+        let path = testutil::socket_path();
+        serve(&path, failing);
+        let mut client = client(&path, "/nonexistent");
+        let error = client.focus_tab("w1:t9").unwrap_err();
+        assert!(error.is_herdr());
+        assert!(error.message.contains("no such tab"), "{}", error);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_socket_falls_back_to_the_cli() {
+        let _env = testutil::env_lock();
+        let dir = TempDir::new();
+        let mut client = client(&dir.path().join("gone.sock"), "/nonexistent");
+        assert!(!client.socket_ok());
+        assert!(client.snapshot().unwrap_err().is_herdr());
+    }
+
+    #[test]
+    fn dead_socket_falls_back_to_the_cli() {
+        // The marker is there but nothing answers: a server that went away.
+        let _env = testutil::env_lock();
+        let dir = TempDir::new();
+        let path = dir.path().join("herdr.sock");
+        std::fs::write(&path, "").unwrap();
+        let mut client = client(&path, "/nonexistent");
+        assert!(client.socket_ok());
+        let error = client.snapshot().unwrap_err();
+        assert!(error.is_herdr());
+        assert!(error.message.contains("not found"), "{}", error);
+        assert!(!client.socket_ok());
+    }
+
+    #[test]
+    fn silent_server_times_out_instead_of_hanging() {
+        let _env = testutil::env_lock();
+        let path = testutil::socket_path();
+        serve(&path, |_| None);
+        let mut client = client(&path, "/nonexistent");
+        client.timeout = 0.3;
+        let started = Instant::now();
+        assert!(client.snapshot().unwrap_err().is_herdr());
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!client.socket_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn socket_only_client_reports_the_timeout() {
+        let _env = testutil::env_lock();
+        let path = testutil::socket_path();
+        serve(&path, |_| None);
+        let mut client = HerdrClient::new(Some(path.to_string_lossy().into_owned()), 0.3, true);
+        let error = client.snapshot().unwrap_err();
+        assert!(error.is_herdr());
+        assert!(error.message.contains("timed out"), "{}", error);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    const SNAPSHOT_JSON: &str =
+        r#"{"id":"cli","result":{"type":"session_snapshot","snapshot":{"tabs":[],"agents":[],"workspaces":[]}}}"#;
+
+    /// A herdr stand-in that prints `output` whatever it is asked.
+    fn fake_herdr(dir: &TempDir, output: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.path().join("fake-herdr");
+        std::fs::write(&bin, format!("#!/bin/sh\necho '{}'\n", output)).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn snapshot_over_the_cli() {
+        let _env = testutil::env_lock();
+        let dir = TempDir::new();
+        let bin = fake_herdr(&dir, SNAPSHOT_JSON);
+        let mut client = client(&dir.path().join("absent.sock"), &bin);
+        assert_eq!(client.snapshot().unwrap().get("tabs"), &Value::List(Vec::new()));
+    }
+
+    #[test]
+    fn missing_binary_reports_clearly() {
+        let _env = testutil::env_lock();
+        let dir = TempDir::new();
+        let mut client = client(&dir.path().join("absent.sock"), "/nonexistent/herdr");
+        let error = client.snapshot().unwrap_err();
+        assert!(error.is_herdr());
+        assert!(error.message.contains("not found"), "{}", error);
+    }
+
+    #[test]
+    fn focus_pane_degrades_to_a_no_op_over_the_cli() {
+        // The CLI cannot focus a pane by id, so without the socket the call
+        // must quietly leave the user on the already-focused tab.
+        let _env = testutil::env_lock();
+        let dir = TempDir::new();
+        let mut client = client(&dir.path().join("absent.sock"), "/nonexistent/herdr");
+        assert_eq!(client.focus_pane("w1:p1"), Ok(()));
+    }
+
+    #[test]
+    fn unparseable_output_reports_clearly() {
+        let _env = testutil::env_lock();
+        let dir = TempDir::new();
+        let bin = fake_herdr(&dir, "not json");
+        let mut client = client(&dir.path().join("absent.sock"), &bin);
+        assert!(client.snapshot().unwrap_err().is_herdr());
+    }
+}

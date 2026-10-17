@@ -591,3 +591,335 @@ pub fn scrollbar_column(total: isize, visible: isize, offset: isize, height: isi
     }
     marks
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{score_item, Memo, PLACEHOLDER};
+    use crate::fuzzy::{split_query, Term};
+    use crate::items::build_items;
+    use crate::textutil::{strip_ansi, visible_width};
+
+    fn theme() -> Theme {
+        Theme::new(None, None, None)
+    }
+
+    fn items() -> Vec<Item> {
+        build_items(&crate::testutil::snapshot())
+    }
+
+    fn row(positions: &[usize]) -> Row {
+        Row { item: 0, positions: positions.to_vec(), field_positions: BTreeMap::new() }
+    }
+
+    fn draw(theme: &Theme, item: &Item, row: &Row, width: isize, selected: bool, age: Option<f64>) -> String {
+        render_row(theme, item, row, width, selected, true, age)
+    }
+
+    /// `Row(item, found[1].get(0, ()), found[1])` for a query.
+    fn matched_row(item: &Item, query: &str) -> Row {
+        let terms: Vec<Term> = split_query(query).iter().map(|t| Term::new(t)).collect();
+        let mut memo = Memo::default();
+        let (_, found) = score_item(&terms, item, &mut memo).expect("query matches");
+        Row { item: 0, positions: found.get(&0).cloned().unwrap_or_default(), field_positions: found }
+    }
+
+    fn has_age(text: &str) -> bool {
+        // r"\d+[hms]\b"
+        let chars: Vec<char> = text.chars().collect();
+        (1..chars.len()).any(|i| {
+            chars[i - 1].is_ascii_digit()
+                && matches!(chars[i], 'h' | 'm' | 's')
+                && chars.get(i + 1).map(|c| !(c.is_alphanumeric() || *c == '_')).unwrap_or(true)
+        })
+    }
+
+    // -- LayoutTest ---------------------------------------------------------
+
+    #[test]
+    fn preview_only_appears_when_there_is_room() {
+        let narrow = compute_layout(70, 20, true);
+        let wide = compute_layout(140, 20, true);
+        assert_eq!(narrow.preview_width, 0);
+        assert!(wide.preview_width > 0);
+        assert_eq!(wide.list_width + wide.preview_width + 3, wide.inner_width);
+    }
+
+    #[test]
+    fn disabled_preview_gives_the_list_everything() {
+        let layout = compute_layout(140, 20, false);
+        assert_eq!(layout.preview_width, 0);
+        assert_eq!(layout.list_width, layout.inner_width);
+    }
+
+    #[test]
+    fn tiny_popups_still_render_a_list() {
+        let layout = compute_layout(20, 3, true);
+        assert!(layout.list_height >= 1);
+        assert!(!layout.rules);
+    }
+
+    // -- ContentTest (render-level parts; the full-frame checks need Bar) ---
+
+    #[test]
+    fn query_is_echoed_in_the_input_row() {
+        let row = render_input(&theme(), "week", 4, 108, PLACEHOLDER, "everything", PROMPT);
+        assert!(row.contains("week"));
+    }
+
+    #[test]
+    fn placeholder_appears_only_when_empty() {
+        let empty = render_input(&theme(), "", 0, 108, PLACEHOLDER, "everything", PROMPT);
+        let typed = render_input(&theme(), "week", 4, 108, PLACEHOLDER, "everything", PROMPT);
+        assert!(empty.contains("jump to a tab"));
+        assert!(!typed.contains("jump to a tab"));
+    }
+
+    #[test]
+    fn top_bar_highlights_the_active_filter() {
+        let accent = theme().fg("accent").to_string();
+        let all = render_input(&theme(), "", 0, 108, PLACEHOLDER, "everything", PROMPT);
+        let agents = render_input(&theme(), "", 0, 108, PLACEHOLDER, "@ agents", PROMPT);
+        assert!(all.contains(&format!("{} everything ", accent)));
+        assert!(strip_ansi(&all).contains("everything"));
+        assert!(agents.contains(&format!("{} @ agents ", accent)));
+        assert!(strip_ansi(&agents).contains("@ agents"));
+    }
+
+    #[test]
+    fn scoped_empty_state_names_the_active_filter() {
+        for filter_name in ["@ agents", "$ shells", "! needs you"] {
+            let theme = theme();
+            let rendered = render_empty_state(&theme, 60, "", true, filter_name).join("\n");
+            let message = strip_ansi(&rendered);
+            assert!(message.contains(&format!("nothing in {} filter", filter_name)));
+            assert!(!message.contains("this filter"));
+            assert!(!rendered.contains("\x1b[7m"));
+            let start = rendered.find(theme.fg("accent")).unwrap();
+            let end = start + rendered[start..].find("\x1b[0m").unwrap();
+            assert!(rendered[start..end].contains(filter_name));
+            assert!(rendered[end..].contains(" filter"));
+        }
+    }
+
+    #[test]
+    fn empty_state_when_nothing_matches() {
+        let lines = render_empty_state(&theme(), 106, "zzzqqq", true, "");
+        assert!(lines.join("\n").contains("no matches"));
+    }
+
+    // -- RowTest ------------------------------------------------------------
+
+    #[test]
+    fn row_is_padded_to_exactly_the_width() {
+        let theme = theme();
+        for width in (20..120).step_by(7) {
+            for item in &items() {
+                let r = draw(&theme, item, &row(&[]), width, false, None);
+                assert_eq!(visible_width(&r) as isize, width, "width {}, {:?}", width, item.title);
+            }
+        }
+    }
+
+    #[test]
+    fn selected_row_is_padded_too() {
+        let (theme, items) = (theme(), items());
+        for width in [30, 60, 100] {
+            assert_eq!(visible_width(&draw(&theme, &items[0], &row(&[]), width, true, None)) as isize, width);
+        }
+    }
+
+    #[test]
+    fn wide_characters_do_not_overflow() {
+        let theme = theme();
+        let mut item = items().remove(0);
+        item.title = "日本語のタブ名前がとても長い場合のテスト".repeat(3);
+        for width in [24, 40, 80] {
+            assert_eq!(visible_width(&draw(&theme, &item, &row(&[]), width, false, None)) as isize, width);
+        }
+    }
+
+    #[test]
+    fn highlights_stay_inside_the_visible_title() {
+        let item = items().remove(0);
+        assert_eq!(visible_width(&draw(&theme(), &item, &row(&[0, 1, 2]), 60, false, None)), 60);
+    }
+
+    #[test]
+    fn a_summary_match_is_highlighted_where_the_summary_is_drawn() {
+        let item = items().into_iter().find(|i| !i.detail.is_empty()).unwrap();
+        let first = item.detail.split_whitespace().next().unwrap().to_string();
+        let r = matched_row(&item, &first);
+        assert!(draw(&theme(), &item, &r, 120, false, None).contains("\x1b[4m"));
+    }
+
+    #[test]
+    fn a_meta_match_is_highlighted_and_the_row_keeps_its_width() {
+        let theme = theme();
+        let item = items().into_iter().find(|i| i.agent_name.as_deref().is_some_and(|n| !n.is_empty())).unwrap();
+        let name = item.agent_name.clone().unwrap();
+        let r = matched_row(&item, &name);
+        let rendered = draw(&theme, &item, &r, 120, false, None);
+        assert!(rendered.contains(&format!("\x1b[4m{}{}", theme.fg("match"), name)));
+        for width in (20..130).step_by(3) {
+            assert_eq!(visible_width(&draw(&theme, &item, &r, width, false, Some(90.0))) as isize, width, "width {}", width);
+        }
+    }
+
+    #[test]
+    fn matched_characters_are_underlined_and_the_rest_is_not() {
+        let theme = theme();
+        let mut item = items().remove(0);
+        item.title = "week loading".into();
+        let r = draw(&theme, &item, &row(&[0, 1, 2, 3]), 60, false, None);
+        assert!(r.contains(&format!("\x1b[4m{}week", theme.fg("match"))));
+        assert!(!r.contains(&format!("\x1b[4m{} loading", theme.fg("match"))));
+        assert_eq!(visible_width(&r), 60);
+    }
+
+    #[test]
+    fn the_summary_follows_the_tab_name_when_there_is_room() {
+        let item = items().into_iter().find(|i| !i.detail.is_empty()).unwrap();
+        let plain = strip_ansi(&draw(&theme(), &item, &row(&[]), 120, false, None));
+        assert!(plain.contains(&format!("{} — {}", item.title, item.detail)));
+    }
+
+    #[test]
+    fn a_narrow_row_drops_the_summary_and_keeps_its_width() {
+        let theme = theme();
+        let item = items().into_iter().find(|i| !i.detail.is_empty()).unwrap();
+        for width in (20..120).step_by(3) {
+            assert_eq!(visible_width(&draw(&theme, &item, &row(&[]), width, false, None)) as isize, width, "width {}", width);
+        }
+        let narrow = strip_ansi(&draw(&theme, &item, &row(&[]), 34, false, None));
+        assert!(!narrow.contains(&item.detail));
+    }
+
+    #[test]
+    fn running_time_joins_the_meta_without_overflowing() {
+        let theme = theme();
+        let item = items().remove(0);
+        for width in (20..120).step_by(7) {
+            assert_eq!(visible_width(&draw(&theme, &item, &row(&[]), width, false, Some(7440.0))) as isize, width);
+        }
+        assert!(draw(&theme, &item, &row(&[]), 90, false, Some(7440.0)).contains("2h04m"));
+    }
+
+    #[test]
+    fn context_is_not_repeated_when_the_summary_already_shows_it() {
+        let mut item = items().into_iter().find(|i| !i.detail.is_empty()).unwrap();
+        item.detail = "pacebeats".into();
+        item.subtitle = "/Users/dev/workspace/pacebeats".into();
+        item.workspace_label = "pacebeats".into();
+        let plain = strip_ansi(&draw(&theme(), &item, &row(&[]), 120, false, None));
+        assert_eq!(plain.matches("pacebeats").count(), 1);
+    }
+
+    #[test]
+    fn context_is_not_repeated_when_it_is_the_title() {
+        let mut item = items().into_iter().find(|i| i.agent.as_deref() == Some("codex")).unwrap();
+        item.title = "erestor".into();
+        item.detail = String::new();
+        item.subtitle = "/Users/dev/workspace/erestor".into();
+        item.workspace_label = "erestor".into();
+        let plain = strip_ansi(&draw(&theme(), &item, &row(&[]), 120, false, None));
+        assert_eq!(plain.matches("erestor").count(), 1);
+    }
+
+    #[test]
+    fn agent_labels_have_distinct_colors() {
+        let theme = theme();
+        let expected =
+            [("claude", "agent_claude"), ("codex", "agent_codex"), ("gemini", "agent_gemini"), ("kimi", "agent_kimi")];
+        let mut item = items()
+            .into_iter()
+            .find(|i| i.agent.as_deref() == Some("claude") && i.agent_name.as_deref().unwrap_or("").is_empty())
+            .unwrap();
+        for (agent, role) in expected {
+            item.agent = Some(agent.into());
+            let rendered = draw(&theme, &item, &row(&[]), 120, false, None);
+            assert!(rendered.contains(&format!("{}{}", theme.fg(role), agent)), "{}", agent);
+        }
+        let colors: std::collections::HashSet<&str> = expected.iter().map(|(_, role)| theme.fg(role)).collect();
+        assert_eq!(colors.len(), expected.len());
+    }
+
+    #[test]
+    fn named_agents_use_their_underlying_agent_color() {
+        let theme = theme();
+        let item = items().into_iter().find(|i| i.agent_name.as_deref().is_some_and(|n| !n.is_empty())).unwrap();
+        let rendered = draw(&theme, &item, &row(&[]), 120, false, None);
+        assert!(rendered.contains(&format!("{}@battery", theme.fg("agent_claude"))));
+    }
+
+    #[test]
+    fn a_pane_with_no_reading_shows_no_time() {
+        let item = items().remove(0);
+        let plain = strip_ansi(&draw(&theme(), &item, &row(&[]), 90, false, None));
+        assert!(!has_age(&plain), "{:?}", plain);
+    }
+
+    #[test]
+    fn working_rows_show_a_steady_glyph() {
+        let item = items().into_iter().find(|i| i.status == "working").unwrap();
+        assert!(strip_ansi(&draw(&theme(), &item, &row(&[]), 60, false, None)).contains("◐ "));
+    }
+
+    // -- WidgetTest ---------------------------------------------------------
+
+    #[test]
+    fn input_row_fits() {
+        for width in [20, 40, 80, 120] {
+            let r = render_input(&theme(), "hello", 5, width, "placeholder text", "@ agents", PROMPT);
+            assert!(visible_width(&r) as isize <= width);
+        }
+    }
+
+    #[test]
+    fn rename_prompt_and_hint_fit() {
+        for width in [20, 40, 80, 120] {
+            let r = render_input(&theme(), "new name", 8, width, "old name", "⏎ save · esc keep", "rename ❯");
+            assert!(visible_width(&r) as isize <= width);
+            assert!(strip_ansi(&r).contains("rename"));
+        }
+    }
+
+    #[test]
+    fn footer_drops_hints_before_overflowing() {
+        let hints = [("↑↓", "move"), ("⏎", "jump"), ("⇥", "scope"), ("esc", "close")];
+        for width in [16, 24, 40, 80] {
+            assert!(visible_width(&render_footer(&theme(), width, &hints, "12/34")) as isize <= width);
+        }
+    }
+
+    #[test]
+    fn confirmation_fits_every_width() {
+        let widths: Vec<isize> = (1..20).chain([24, 40, 60, 80, 120]).collect();
+        for width in widths {
+            for agents in [1, 3] {
+                let r = render_confirm(&theme(), width, "library depth battery", agents);
+                assert!(visible_width(&r) as isize <= width, "width {}", width);
+            }
+        }
+    }
+
+    #[test]
+    fn confirmation_warns_when_more_than_one_agent_goes() {
+        assert!(render_confirm(&theme(), 80, "server", 3).contains("3 agents"));
+        assert!(!render_confirm(&theme(), 80, "server", 1).contains("agents"));
+    }
+
+    #[test]
+    fn scrollbar_only_when_the_list_overflows() {
+        assert!(scrollbar_column(5, 10, 0, 10).is_empty());
+        let marks = scrollbar_column(50, 10, 0, 10);
+        assert_eq!(marks.len(), 10);
+        assert_eq!(marks[&0], "┃");
+        assert_eq!(marks[&9], "│");
+    }
+
+    #[test]
+    fn scrollbar_thumb_tracks_the_offset() {
+        assert_eq!(scrollbar_column(50, 10, 40, 10)[&9], "┃");
+    }
+}

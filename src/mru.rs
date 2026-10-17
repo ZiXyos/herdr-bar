@@ -153,3 +153,117 @@ fn create_temp(directory: &Path, prefix: &str, suffix: &str) -> std::io::Result<
     }
     Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no usable temporary file name"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::TempDir;
+
+    fn state_path(dir: &TempDir) -> PathBuf {
+        dir.path().join("state").join("recent.json")
+    }
+
+    #[test]
+    fn touch_orders_most_recent_first() {
+        let mut recents = Recents::new(None);
+        recents.touch("a", "");
+        recents.touch("b", "");
+        assert_eq!(recents.rank("b", ""), Some(0));
+        assert_eq!(recents.rank("a", ""), Some(1));
+    }
+
+    #[test]
+    fn touching_again_moves_to_the_front_without_duplicating() {
+        let mut recents = Recents::new(None);
+        recents.touch("a", "");
+        recents.touch("b", "");
+        recents.touch("a", "");
+        assert_eq!(recents.rank("a", ""), Some(0));
+        assert_eq!(recents.entries.len(), 2);
+    }
+
+    #[test]
+    fn unknown_keys_have_no_rank() {
+        assert_eq!(Recents::new(None).rank("nope", ""), None);
+    }
+
+    #[test]
+    fn titles_match_when_ids_change_between_sessions() {
+        let mut recents = Recents::new(None);
+        recents.touch("w1:p4", "cards meaningless");
+        assert_eq!(recents.rank("w9:p9", "cards meaningless"), Some(0));
+    }
+
+    #[test]
+    fn list_is_capped() {
+        let mut recents = Recents::new(None);
+        for index in 0..MAX_ENTRIES + 25 {
+            recents.touch(&format!("key-{}", index), "");
+        }
+        assert_eq!(recents.entries.len(), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn round_trip_through_disk() {
+        let dir = TempDir::new();
+        let mut recents = Recents::new(Some(state_path(&dir)));
+        recents.touch("a", "Agent A");
+        recents.save();
+        assert_eq!(Recents::new(Some(state_path(&dir))).rank("a", ""), Some(0));
+    }
+
+    #[test]
+    fn save_is_atomic_and_creates_the_directory() {
+        let dir = TempDir::new();
+        let path = state_path(&dir);
+        let mut recents = Recents::new(Some(path.clone()));
+        recents.touch("a", "");
+        recents.save();
+        let text = std::fs::read_to_string(&path).expect("state file written");
+        assert_eq!(pyjson::loads(&text).unwrap().get("version"), &Value::Int(1));
+        // No temporary file is left next to it.
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("recent.json")]);
+    }
+
+    #[test]
+    fn corrupt_state_is_ignored() {
+        let dir = TempDir::new();
+        let path = state_path(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(Recents::new(Some(path)).entries.is_empty());
+    }
+
+    #[test]
+    fn junk_entries_are_dropped() {
+        let dir = TempDir::new();
+        let path = state_path(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"entries": [{"key": "ok"}, {"nope": 1}, "string", 5]}"#).unwrap();
+        let recents = Recents::new(Some(path));
+        let keys: Vec<&str> = recents.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, ["ok"]);
+    }
+
+    #[test]
+    fn saving_without_a_path_is_a_no_op() {
+        let mut recents = Recents::new(None);
+        recents.touch("a", "");
+        recents.save();
+    }
+
+    #[test]
+    fn unwritable_location_does_not_raise() {
+        // A regular file where the state directory should be: unwritable on
+        // every platform, even for root.
+        let dir = TempDir::new();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, "").unwrap();
+        let path = blocker.join("state").join("recent.json");
+        let mut recents = Recents::new(Some(path.clone()));
+        recents.touch("a", "");
+        recents.save();
+        assert!(!path.exists());
+    }
+}

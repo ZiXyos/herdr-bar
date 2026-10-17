@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Remove the Python implementation, its tests and its tools. Rust tests now
+  hold the binary to what the last Python release did: the Python unit tests
+  are ported, about 19,000 recorded answers of the Python functions are
+  replayed, and an end-to-end test drives the binary on a pty against a fake
+  Herdr and compares every screen, repaint size, Herdr request and state file
+  with transcripts recorded from the Python release.
+- Remove `run.py`. A title watcher that a Python release (0.8 or older)
+  started hands over to a new release through `run.py`, so after an upgrade
+  straight from 0.8 or older its tab titles stop updating. Run "Stop tab
+  watcher" and then "Start tab watcher" once. Restarting Herdr is not enough,
+  because the old watcher keeps running across a server restart.
+
 ## 0.9.0
 
 - Run the bar and the title watcher as a Rust binary at `bin/herdr-bar`

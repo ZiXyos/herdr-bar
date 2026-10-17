@@ -412,3 +412,303 @@ fn row_patch(y: usize, old: &[Cell], new: &[Cell], ink: isize, width: usize, mut
     }
     (out, style)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chars(cells: &[Cell]) -> Vec<char> {
+        cells.iter().map(|c| c.ch).collect()
+    }
+
+    fn bold(cell: &Cell) -> bool {
+        style_data(cell.style).bold
+    }
+
+    fn rows(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn style(fg: Option<&str>, bg: Option<&str>, bold: bool, underline: bool, reverse: bool) -> Style {
+        intern(StyleData { fg: fg.map(Into::into), bg: bg.map(Into::into), bold, underline, reverse })
+    }
+
+    // CellsTest
+
+    #[test]
+    fn plain_text_fills_from_the_left() {
+        let (cells, ink) = cells_of("hi", 5);
+        assert_eq!(chars(&cells), vec!['h', 'i', ' ', ' ', ' ']);
+        assert_eq!(ink, 1);
+    }
+
+    #[test]
+    fn an_empty_row_has_no_ink() {
+        let (cells, ink) = cells_of("", 4);
+        assert_eq!(ink, -1);
+        assert_eq!(chars(&cells), vec![' '; 4]);
+    }
+
+    #[test]
+    fn trailing_spaces_are_not_ink() {
+        assert_eq!(cells_of("hi     ", 12).1, 1);
+    }
+
+    #[test]
+    fn a_coloured_space_is_ink() {
+        assert_eq!(cells_of("\x1b[48;5;237m  \x1b[0m", 8).1, 1);
+    }
+
+    #[test]
+    fn a_wide_glyph_covers_two_cells() {
+        let (cells, ink) = cells_of("漢x", 6);
+        assert_eq!(chars(&cells[..3]), vec!['漢', CONTINUATION, 'x']);
+        assert_eq!(ink, 2);
+    }
+
+    #[test]
+    fn a_wide_glyph_carries_its_rendition_into_both_cells() {
+        let (cells, _) = cells_of("\x1b[1m漢", 4);
+        assert_eq!(cells[0].style, cells[1].style);
+        assert!(bold(&cells[1]));
+    }
+
+    #[test]
+    fn text_wider_than_the_row_is_cut() {
+        let (cells, ink) = cells_of("abcdef", 3);
+        assert_eq!(chars(&cells), vec!['a', 'b', 'c']);
+        assert_eq!(ink, 2);
+    }
+
+    #[test]
+    fn a_wide_glyph_in_the_last_column_keeps_its_cell() {
+        let (cells, ink) = cells_of("ab漢", 3);
+        assert_eq!(chars(&cells), vec!['a', 'b', '漢']);
+        assert_eq!(ink, 2);
+    }
+
+    #[test]
+    fn renditions_apply_to_what_follows_them() {
+        let (cells, _) = cells_of("a\x1b[1mb\x1b[0mc", 4);
+        assert!(!bold(&cells[0]));
+        assert!(bold(&cells[1]));
+        assert!(!bold(&cells[2]));
+    }
+
+    #[test]
+    fn zero_width_characters_take_no_cell() {
+        let (cells, ink) = cells_of("a\u{301}b", 4);
+        assert_eq!(chars(&cells[..2]), vec!['a', 'b']);
+        assert_eq!(ink, 1);
+    }
+
+    #[test]
+    fn a_truncated_escape_ends_the_row() {
+        let (cells, _) = cells_of("ab\x1b[38;5", 5);
+        assert_eq!(chars(&cells[..2]), vec!['a', 'b']);
+    }
+
+    #[test]
+    fn non_csi_escapes_are_skipped_without_eating_the_text() {
+        let (cells, _) = cells_of("a\x1bMb", 4);
+        assert_eq!(chars(&cells[..2]), vec!['a', 'b']);
+    }
+
+    // StyleTest
+
+    #[test]
+    fn encoded_renditions_parse_back_to_themselves() {
+        let styles = [
+            DEFAULT_STYLE,
+            style(Some("38;5;244"), None, false, false, false),
+            style(Some("38;2;10;20;30"), Some("48;5;237"), true, true, false),
+            style(None, Some("48;5;237"), false, false, true),
+            style(Some("38;5;12"), None, true, false, false),
+            style(None, None, false, true, false),
+        ];
+        for &start in &styles {
+            for &target in &styles {
+                let sequence = encode_style(start, target);
+                let mut landed = start;
+                let mut rest = sequence.as_str();
+                while let Some(at) = rest.find("\x1b[") {
+                    let body = &rest[at + 2..];
+                    let end = body.find('m').expect("SGR terminator");
+                    let params = &body[..end];
+                    assert!(params.bytes().all(|b| b.is_ascii_digit() || b == b';'), "{sequence:?}");
+                    landed = sgr(params, landed);
+                    rest = &body[end + 1..];
+                }
+                assert_eq!(*style_data(landed), *style_data(target), "{start} -> {target} via {sequence:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_change_costs_nothing() {
+        assert_eq!(encode_style(DEFAULT_STYLE, DEFAULT_STYLE), "");
+    }
+
+    #[test]
+    fn going_back_to_plain_is_a_single_reset() {
+        let b = style(None, None, true, false, false);
+        assert_eq!(encode_style(b, DEFAULT_STYLE), "\x1b[0m");
+    }
+
+    #[test]
+    fn adding_an_attribute_does_not_rebuild_the_rest() {
+        let colored = style(Some("38;5;244"), None, false, false, false);
+        let both = style(Some("38;5;244"), None, true, false, false);
+        assert_eq!(encode_style(colored, both), "\x1b[1m");
+    }
+
+    // PainterTest
+
+    #[test]
+    fn the_first_frame_paints_everything() {
+        let mut painter = Painter::new();
+        let out = painter.frame(&rows(&["hello"]), 20, 3);
+        assert!(out.contains("hello"));
+        assert!(out.contains("\x1b[J"));
+    }
+
+    #[test]
+    fn a_frame_that_changes_nothing_emits_nothing() {
+        let mut painter = Painter::new();
+        painter.frame(&rows(&["hello", "there"]), 20, 3);
+        assert_eq!(painter.frame(&rows(&["hello", "there"]), 20, 3), "");
+    }
+
+    #[test]
+    fn one_character_costs_a_handful_of_bytes() {
+        let mut painter = Painter::new();
+        painter.frame(&["x".repeat(40)], 40, 2);
+        let out = painter.frame(&[format!("{}y{}", "x".repeat(20), "x".repeat(19))], 40, 2);
+        assert!(out.contains('y'));
+        assert!(out.len() < 12, "{out:?}");
+    }
+
+    #[test]
+    fn an_untouched_row_is_not_resent() {
+        let mut painter = Painter::new();
+        painter.frame(&rows(&["one", "two", "three"]), 20, 3);
+        let out = painter.frame(&rows(&["one", "TWO", "three"]), 20, 3);
+        assert!(!out.contains("one"));
+        assert!(!out.contains("three"));
+        assert!(out.contains("TWO"));
+    }
+
+    #[test]
+    fn a_tail_that_goes_blank_is_erased_not_overwritten() {
+        let mut painter = Painter::new();
+        painter.frame(&["abcdefghij".repeat(4)], 40, 2);
+        let out = painter.frame(&rows(&["abc"]), 40, 2);
+        assert!(out.contains("\x1b[K"));
+        assert!(out.len() < 16, "{out:?}");
+    }
+
+    #[test]
+    fn a_background_is_cleared_before_erasing() {
+        let mut painter = Painter::new();
+        painter.frame(&[format!("\x1b[48;5;237m{}\x1b[0m", "x".repeat(30))], 40, 2);
+        let out = painter.frame(&[format!("\x1b[48;5;237m{}\x1b[0m", "y".repeat(5))], 40, 2);
+        let at = out.find("\x1b[K").expect("erase");
+        assert!(out[..at].ends_with("\x1b[0m"), "{out:?}");
+    }
+
+    #[test]
+    fn two_distant_edits_jump_rather_than_rewrite_the_middle() {
+        let mut painter = Painter::new();
+        painter.frame(&["x".repeat(60)], 60, 2);
+        let out = painter.frame(&[format!("y{}z", "x".repeat(58))], 60, 2);
+        assert!(out.contains('y'));
+        assert!(out.contains('z'));
+        assert!(!out.contains("xxxxx"));
+    }
+
+    #[test]
+    fn a_gap_shorter_than_a_jump_is_overwritten() {
+        let mut painter = Painter::new();
+        painter.frame(&["x".repeat(20)], 20, 2);
+        let row = format!("y{}y{}", "x".repeat(JUMP_COST - 2), "x".repeat(21 - JUMP_COST));
+        let out = painter.frame(&[row], 20, 2);
+        assert_eq!(out.matches("\x1b[").count(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn a_rendition_carries_between_frames() {
+        let mut painter = Painter::new();
+        painter.frame(&rows(&["\x1b[1mabcd\x1b[0m"]), 20, 2);
+        painter.frame(&rows(&["\x1b[1mabcX\x1b[0m"]), 20, 2);
+        let out = painter.frame(&rows(&["\x1b[1mabYX\x1b[0m"]), 20, 2);
+        assert!(out.contains('Y'));
+        assert!(!out.contains("\x1b[1m"));
+    }
+
+    #[test]
+    fn a_run_that_ends_on_a_wide_glyph_covers_both_of_its_cells() {
+        let mut painter = Painter::new();
+        painter.frame(&rows(&["a漢b"]), 10, 2);
+        let out = painter.frame(&rows(&["a字b"]), 10, 2);
+        assert!(out.contains('字'));
+        assert!(!out.contains('b'));
+    }
+
+    #[test]
+    fn a_resize_repaints_everything() {
+        let mut painter = Painter::new();
+        painter.frame(&rows(&["hello"]), 20, 3);
+        let out = painter.frame(&rows(&["hello"]), 30, 3);
+        assert!(out.contains("hello"));
+        assert!(out.contains("\x1b[J"));
+    }
+
+    #[test]
+    fn reset_repaints_everything() {
+        let mut painter = Painter::new();
+        painter.frame(&rows(&["hello"]), 20, 3);
+        assert_eq!(painter.frame(&rows(&["hello"]), 20, 3), "");
+        painter.reset();
+        assert!(painter.frame(&rows(&["hello"]), 20, 3).contains("hello"));
+    }
+
+    #[test]
+    fn rows_beyond_the_screen_are_dropped() {
+        let mut painter = Painter::new();
+        let out = painter.frame(&rows(&["one", "two", "three"]), 20, 2);
+        assert!(!out.contains("three"));
+    }
+
+    #[test]
+    fn rows_that_disappear_are_cleared() {
+        let mut painter = Painter::new();
+        painter.frame(&rows(&["one", "two"]), 20, 3);
+        let out = painter.frame(&rows(&["one"]), 20, 3);
+        assert!(out.contains("\x1b[K"));
+        assert_eq!(*painter.grid[1], *cells_of("", 20).0);
+    }
+
+    #[test]
+    fn the_model_tracks_what_was_drawn() {
+        let mut painter = Painter::new();
+        painter.frame(&rows(&["hello", "world"]), 20, 3);
+        painter.frame(&rows(&["hello", "WORLD"]), 20, 3);
+        assert_eq!(*painter.grid[1], *cells_of("WORLD", 20).0);
+    }
+
+    // ComposeTest
+
+    #[test]
+    fn every_row_is_positioned_and_cleared() {
+        let out = compose(&rows(&["a", "b"]));
+        assert!(out.contains("\x1b[1;1H"));
+        assert!(out.contains("\x1b[2;1H"));
+        assert_eq!(out.matches("\x1b[K").count(), 2);
+        assert!(out.ends_with("\x1b[J"));
+    }
+
+    #[test]
+    fn it_does_not_inherit_a_rendition() {
+        assert!(compose(&rows(&["a"])).starts_with("\x1b[0m"));
+    }
+}

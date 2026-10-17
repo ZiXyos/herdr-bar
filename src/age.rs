@@ -204,10 +204,11 @@ pub fn format_age(seconds: f64) -> String {
     format!("{}d{}h", days, hours)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn batch_reads_match_one_at_a_time() {
         let pids = vec![
@@ -229,5 +230,97 @@ mod tests {
             }
         }
         assert!(batched[0].is_some() && batched[2].is_some());
+    }
+
+    fn info(text: &str) -> Value {
+        pyjson::loads(text).unwrap()
+    }
+
+    #[test]
+    fn the_group_leader_wins_over_its_children() {
+        let info = info(r#"{"foreground_process_group_id": 200, "foreground_processes": [{"pid": 311}, {"pid": 200}, {"pid": 480}], "shell_pid": 100}"#);
+        assert_eq!(pid_for(&info), Some(Value::Int(200)));
+    }
+
+    #[test]
+    fn the_first_process_stands_in_for_an_unlisted_leader() {
+        let info = info(r#"{"foreground_process_group_id": 999, "foreground_processes": [{"pid": 311}], "shell_pid": 100}"#);
+        assert_eq!(pid_for(&info), Some(Value::Int(311)));
+    }
+
+    #[test]
+    fn an_idle_pane_falls_back_to_its_shell() {
+        assert_eq!(pid_for(&info(r#"{"foreground_processes": [], "shell_pid": 100}"#)), Some(Value::Int(100)));
+    }
+
+    #[test]
+    fn nothing_usable_reads_as_no_pid() {
+        assert_eq!(pid_for(&info("{}")), None);
+        assert_eq!(pid_for(&info(r#"{"shell_pid": 0, "foreground_processes": [{"pid": "x"}]}"#)), None);
+    }
+
+    #[test]
+    fn minutes_and_seconds() {
+        assert_eq!(parse_etime("07:23"), Some(443.0));
+    }
+
+    #[test]
+    fn hours() {
+        assert_eq!(parse_etime("02:04:00"), Some(7440.0));
+    }
+
+    #[test]
+    fn days() {
+        assert_eq!(parse_etime("3-04:05:06"), Some((3 * 86400 + 4 * 3600 + 5 * 60 + 6) as f64));
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_ignored() {
+        assert_eq!(parse_etime("      01:00\n"), Some(60.0));
+    }
+
+    #[test]
+    fn junk_reads_as_unknown() {
+        for text in ["", "   ", "not-a-time", "1:2:3:4", "x-01:00"] {
+            assert_eq!(parse_etime(text), None, "{:?}", text);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn this_process_has_an_age() {
+        let seconds = elapsed_seconds(&Value::Int(std::process::id() as i128));
+        assert!(seconds.is_some_and(|s| s >= 0.0), "{:?}", seconds);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_pid_reads_as_unknown() {
+        assert_eq!(elapsed_seconds(&Value::Int(1 << 30)), None);
+    }
+
+    #[test]
+    fn shapes() {
+        assert_eq!(format_age(0.0), "0s");
+        assert_eq!(format_age(59.9), "59s");
+        assert_eq!(format_age(60.0), "1m");
+        assert_eq!(format_age(3599.0), "59m");
+        assert_eq!(format_age(3600.0), "1h00m");
+        assert_eq!(format_age(7440.0), "2h04m");
+        assert_eq!(format_age(86399.0), "23h59m");
+        assert_eq!(format_age(86400.0), "1d0h");
+        assert_eq!(format_age((4 * 86400 + 3 * 3600) as f64), "4d3h");
+    }
+
+    #[test]
+    fn it_stays_short_enough_for_a_row() {
+        for seconds in [0, 61, 3601, 86401, 400 * 86400] {
+            assert!(format_age(seconds as f64).len() <= 6, "{}", seconds);
+        }
+    }
+
+    #[test]
+    fn a_negative_age_shows_nothing() {
+        assert_eq!(format_age(-1.0), "");
     }
 }

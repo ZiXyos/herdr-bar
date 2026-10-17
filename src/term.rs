@@ -607,6 +607,31 @@ mod backend {
         reader.pending = pending;
         appearance_from_reply(&buffer)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn typed_bytes_survive_the_appearance_reply() {
+            assert_eq!(strip_reply(b"ab\x1b]11;rgb:0000/0000/0000\x07cd"), b"abcd");
+            assert_eq!(strip_reply(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\"), b"");
+            assert_eq!(strip_reply(b"x\x1b]11;rgb:00"), b"x");
+            assert_eq!(strip_reply(b"plain typing"), b"plain typing");
+        }
+
+        #[test]
+        fn raw_mode_turns_on_virtual_terminal_input_and_off_echo() {
+            let mode = raw_input_mode(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE, true);
+            assert_ne!(mode & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+            assert_ne!(mode & ENABLE_MOUSE_INPUT, 0);
+            assert_ne!(mode & ENABLE_EXTENDED_FLAGS, 0);
+            for flag in [ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_PROCESSED_INPUT] {
+                assert_eq!(mode & flag, 0);
+            }
+            assert_eq!(raw_input_mode(0, false) & ENABLE_MOUSE_INPUT, 0);
+        }
+    }
 }
 
 pub use backend::{detect_appearance, isatty, restore_console, Terminal};

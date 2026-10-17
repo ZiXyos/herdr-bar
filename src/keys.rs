@@ -299,3 +299,134 @@ fn mouse_event(params: &str, final_byte: u8) -> Option<Event> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(s: &str) -> Event {
+        Event::Key(s.into())
+    }
+
+    fn text(s: &str) -> Event {
+        Event::Text(s.into())
+    }
+
+    fn mouse_kinds(events: &[Event]) -> Vec<MouseKind> {
+        events
+            .iter()
+            .map(|e| match e {
+                Event::Mouse { kind, .. } => *kind,
+                other => panic!("not a mouse event: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plain_text() {
+        assert_eq!(KeyDecoder::new().feed(b"hi"), vec![text("h"), text("i")]);
+    }
+
+    #[test]
+    fn control_keys() {
+        assert_eq!(
+            KeyDecoder::new().feed(b"\r\t\x7f\x15\x0f"),
+            vec![key("enter"), key("tab"), key("backspace"), key("ctrl+u"), key("ctrl+o")]
+        );
+    }
+
+    #[test]
+    fn ctrl_j_and_ctrl_k() {
+        assert_eq!(KeyDecoder::new().feed(b"\x0a\x0b"), vec![key("ctrl+j"), key("ctrl+k")]);
+    }
+
+    #[test]
+    fn arrows_and_navigation() {
+        let data = b"\x1b[A\x1b[B\x1b[C\x1b[D\x1b[5~\x1b[6~\x1b[H\x1b[F\x1b[3~\x1b[Z";
+        let expected: Vec<Event> =
+            ["up", "down", "right", "left", "pgup", "pgdn", "home", "end", "delete", "shift+tab"]
+                .iter()
+                .map(|k| key(k))
+                .collect();
+        assert_eq!(KeyDecoder::new().feed(data), expected);
+    }
+
+    #[test]
+    fn application_cursor_keys() {
+        assert_eq!(KeyDecoder::new().feed(b"\x1bOA"), vec![key("up")]);
+    }
+
+    #[test]
+    fn modified_arrows() {
+        assert_eq!(KeyDecoder::new().feed(b"\x1b[1;5A"), vec![key("ctrl+up")]);
+    }
+
+    #[test]
+    fn escape_needs_a_flush() {
+        let mut decoder = KeyDecoder::new();
+        assert_eq!(decoder.feed(b"\x1b"), vec![]);
+        assert!(decoder.pending_escape());
+        assert_eq!(decoder.flush(), vec![key("esc")]);
+    }
+
+    #[test]
+    fn escape_followed_by_a_letter_is_alt() {
+        assert_eq!(KeyDecoder::new().feed(b"\x1bx"), vec![key("alt+x")]);
+    }
+
+    #[test]
+    fn sequence_split_across_reads() {
+        let mut decoder = KeyDecoder::new();
+        assert_eq!(decoder.feed(b"\x1b["), vec![]);
+        assert_eq!(decoder.feed(b"B"), vec![key("down")]);
+    }
+
+    #[test]
+    fn utf8_split_across_reads() {
+        let mut decoder = KeyDecoder::new();
+        assert_eq!(decoder.feed(b"\xc3"), vec![]);
+        assert_eq!(decoder.feed(b"\xa9"), vec![text("é")]);
+    }
+
+    #[test]
+    fn wide_characters() {
+        assert_eq!(KeyDecoder::new().feed("日".as_bytes()), vec![text("日")]);
+    }
+
+    #[test]
+    fn bracketed_paste() {
+        assert_eq!(
+            KeyDecoder::new().feed(b"\x1b[200~one two\x1b[201~"),
+            vec![Event::Paste("one two".into())]
+        );
+    }
+
+    #[test]
+    fn paste_split_across_reads() {
+        let mut decoder = KeyDecoder::new();
+        assert_eq!(decoder.feed(b"\x1b[200~par"), vec![]);
+        assert_eq!(decoder.feed(b"tial\x1b[201~"), vec![Event::Paste("partial".into())]);
+    }
+
+    #[test]
+    fn mouse_press_and_wheel() {
+        let events = KeyDecoder::new().feed(b"\x1b[<0;12;5M\x1b[<64;1;1M\x1b[<65;1;1M");
+        assert_eq!(mouse_kinds(&events), vec![MouseKind::Press, MouseKind::WheelUp, MouseKind::WheelDown]);
+        assert_eq!(events[0], Event::Mouse { kind: MouseKind::Press, x: 12, y: 5 });
+    }
+
+    #[test]
+    fn osc_replies_are_swallowed() {
+        assert_eq!(KeyDecoder::new().feed(b"\x1b]11;rgb:1e1e/1e1e/2e2e\x07k"), vec![text("k")]);
+    }
+
+    #[test]
+    fn osc_reply_with_string_terminator() {
+        assert_eq!(KeyDecoder::new().feed(b"\x1b]11;rgb:0/0/0\x1b\\z"), vec![text("z")]);
+    }
+
+    #[test]
+    fn unknown_sequences_are_ignored() {
+        assert_eq!(KeyDecoder::new().feed(b"\x1b[?25h"), vec![]);
+    }
+}

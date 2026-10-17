@@ -46,24 +46,18 @@ jobs:
           persist-credentials: false
       - name: Tag matches every version source
         run: |
-          python3 - <<'PY'
-          import os, re, sys
-          def grab(path, pattern):
-              with open(path, encoding="utf-8") as handle:
-                  match = re.search(pattern, handle.read(), re.M)
-              return match.group(1) if match else None
-          found = {
-              "tag": os.environ["TAG"],
-              "herdr-plugin.toml": "v%s" % grab("herdr-plugin.toml", r'^version\s*=\s*"([^"]+)"'),
-              "Cargo.toml": "v%s" % grab("Cargo.toml", r'^version\s*=\s*"([^"]+)"'),
-              "src/cli.rs": "v%s" % grab("src/cli.rs", r'^pub const VERSION: &str = "([^"]+)"'),
-              "src/herdr_bar/__init__.py": "v%s" % grab("src/herdr_bar/__init__.py", r'^__version__\s*=\s*"([^"]+)"'),
-          }
-          for source, value in found.items():
-              print("%-28s %s" % (source, value))
-          if len(set(found.values())) != 1:
-              sys.exit("version mismatch: the tag and every version source must agree")
-          PY
+          # The first line of FILE that matches PATTERN, reduced to its group.
+          grab() { sed -n -E "s/$2/\1/p" "$1" | head -n 1; }
+          plugin="v$(grab herdr-plugin.toml '^version[[:space:]]*=[[:space:]]*"([^"]+)".*')"
+          cargo="v$(grab Cargo.toml '^version[[:space:]]*=[[:space:]]*"([^"]+)".*')"
+          cli="v$(grab src/cli.rs '^pub const VERSION: &str = "([^"]+)".*')"
+          printf '%-28s %s\n' tag "$TAG" herdr-plugin.toml "$plugin" Cargo.toml "$cargo" src/cli.rs "$cli"
+          for found in "$plugin" "$cargo" "$cli"; do
+            if [ "$found" != "$TAG" ]; then
+              echo "version mismatch: the tag and every version source must agree" >&2
+              exit 1
+            fi
+          done
 
   build:
     needs: versions

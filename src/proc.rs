@@ -125,7 +125,10 @@ mod tests {
 
     #[test]
     fn deadline_holds_when_a_grandchild_keeps_the_pipe() {
-        let argv: Vec<String> = ["sh", "-c", "sleep 5 & echo hi"].iter().map(|s| s.to_string()).collect();
+        // Short-lived on purpose: a child another test forks at the wrong
+        // moment can inherit a pipe (macOS sets close-on-exec in a second
+        // step), and this one would hold it open for as long as it sleeps.
+        let argv: Vec<String> = ["sh", "-c", "sleep 1 & echo hi"].iter().map(|s| s.to_string()).collect();
         let started = Instant::now();
         assert!(matches!(run(&argv, 0.5), Err(RunError::Timeout)));
         assert!(started.elapsed() < Duration::from_secs(3));
@@ -134,7 +137,10 @@ mod tests {
     #[test]
     fn output_is_collected() {
         let argv: Vec<String> = ["sh", "-c", "echo hi; echo err >&2"].iter().map(|s| s.to_string()).collect();
-        let Ok(output) = run(&argv, 5.0) else { panic!("run failed") };
+        // A generous deadline: a child forked by a concurrent test may hold
+        // this pipe for a moment (see above), which delays EOF but must not
+        // fail the test.
+        let Ok(output) = run(&argv, 30.0) else { panic!("run failed") };
         assert_eq!(output.stdout, b"hi\n");
         assert_eq!(output.stderr, b"err\n");
         assert!(output.success);

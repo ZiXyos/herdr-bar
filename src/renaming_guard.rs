@@ -246,4 +246,120 @@ mod tests {
             assert!(!naming_search(text), "{}", text);
         }
     }
+
+    // -- ported from tests/test_renaming_guard.py -------------------------------
+
+    fn plugin(json: &str) -> Map {
+        pyjson::loads(json).unwrap().as_dict().unwrap().clone()
+    }
+
+    fn is_detected(result: Result<()>) -> bool {
+        matches!(result, Err(HerdrError { kind: crate::client::Kind::Renaming, .. }))
+    }
+
+    #[test]
+    fn known_enabled_renamers_block_and_disabled_ones_do_not() {
+        for id in KNOWN_RENAMERS {
+            let on = plugin(&format!(r#"{{"plugin_id": "{}", "enabled": true}}"#, id));
+            assert!(is_detected(check_plugins(&[on], &[])), "{}", id);
+            let off = plugin(&format!(r#"{{"plugin_id": "{}", "enabled": false}}"#, id));
+            assert!(check_plugins(&[off], &[]).is_ok(), "{}", id);
+        }
+    }
+
+    #[test]
+    fn forks_and_new_plugins_are_detected_from_metadata() {
+        for fields in [
+            r#""name": "Smart tab renaming""#,
+            r#""description": "Automatically rename tabs from the current task""#,
+            r#""source": {"repo": "herdr-auto-title"}"#,
+        ] {
+            let custom = plugin(&format!(r#"{{"plugin_id": "custom.plugin", "enabled": true, {}}}"#, fields));
+            assert!(is_detected(check_plugins(&[custom], &[])), "{}", fields);
+        }
+    }
+
+    #[test]
+    fn self_and_unrelated_plugins_do_not_block() {
+        let plugins = [
+            plugin(r#"{"plugin_id": "herdr-bar", "enabled": true, "description": "Automatic tab titles"}"#),
+            plugin(r#"{"plugin_id": "herdr-newtab-plus", "enabled": true, "description": "Pick a folder and open a tab"}"#),
+            plugin(r#"{"plugin_id": "herdr-grid", "enabled": true, "name": "Agent Grid"}"#),
+        ];
+        assert!(check_plugins(&plugins, &[]).is_ok());
+    }
+
+    #[test]
+    fn custom_ids_can_be_declared() {
+        let private = plugin(r#"{"plugin_id": "private.tools", "enabled": true}"#);
+        assert!(is_detected(check_plugins(&[private], &["private.tools".to_string()])));
+    }
+
+    #[cfg(unix)]
+    mod with_server {
+        use super::*;
+        use crate::tab_status::tests::{config, pair, quiet_env, session, FakeHerdr};
+        use crate::tab_status::TabStatus;
+        use crate::testutil::{env_lock, EnvVars, TempDir};
+
+        fn plugins(server: &FakeHerdr, reply: &str) {
+            server.state().plugin_reply = pyjson::loads(reply).unwrap();
+        }
+
+        #[test]
+        fn plugin_enabled_between_writes_blocks_the_next_write() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let server = FakeHerdr::new(session("working", "2"));
+            let mut writer = server.writer();
+            writer.rename_tab("w1:t1", "First").unwrap();
+            plugins(&server, r#"{"result": {"plugins": [{"plugin_id": "herdr.auto-title", "enabled": true}]}}"#);
+            assert!(is_detected(writer.rename_tab("w1:t1", "Second")));
+            plugins(&server, r#"{"result": {"plugins": []}}"#);
+            assert!(is_detected(writer.rename_tab("w1:t2", "Third")), "the conflict sticks");
+            assert_eq!(server.renames(), pair("w1:t1", "First"));
+        }
+
+        #[test]
+        fn unavailable_or_invalid_registry_never_allows_a_write() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            for reply in [r#"{"result": {}}"#, r#"{"result": {"plugins": [null]}}"#, r#"{"error": {"message": "offline"}}"#] {
+                let server = FakeHerdr::new(session("working", "2"));
+                plugins(&server, reply);
+                assert!(server.writer().rename_tab("w1:t1", "Changed").is_err(), "{}", reply);
+                assert_eq!(server.renames(), vec![], "{}", reply);
+            }
+        }
+
+        #[test]
+        fn custom_config_blocks_writes() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let dir = TempDir::new();
+            std::fs::write(dir.path().join("config.json"), r#"{"tab_renaming_plugins": ["private.tools"]}"#).unwrap();
+            let mut vars = EnvVars::new();
+            vars.set("HERDR_PLUGIN_CONFIG_DIR", dir.path());
+            let server = FakeHerdr::new(session("working", "2"));
+            plugins(&server, r#"{"result": {"plugins": [{"plugin_id": "private.tools", "enabled": true}]}}"#);
+            assert!(is_detected(server.writer().rename_tab("w1:t1", "Changed")));
+            assert_eq!(server.renames(), vec![]);
+        }
+
+        #[test]
+        fn competing_plugin_prevents_cleanup_writes_too() {
+            let _env = env_lock();
+            let _vars = quiet_env();
+            let dir = TempDir::new();
+            let server = FakeHerdr::new(session("working", "Fix login"));
+            let mut tabs = TabStatus::new(server.writer(), Some(dir.path().to_path_buf()));
+            tabs.configure(&config(r#"{"tab_status": true, "agent_icons": "none"}"#));
+            let snapshot = tabs.snapshot().unwrap();
+            tabs.apply(&snapshot);
+            plugins(&server, r#"{"result": {"plugins": [{"plugin_id": "herdr.auto-title", "enabled": true}]}}"#);
+            tabs.clear();
+            assert_eq!(server.renames(), pair("w1:t2", "◐ Fix login"));
+            assert_eq!(server.label("w1:t2"), "◐ Fix login");
+        }
+    }
 }
