@@ -11,6 +11,18 @@ publish = false
 name = "herdr-bar"
 path = "src/main.rs"
 
+[features]
+# Only for the README demo recorder (examples/record_demo); never in the binary.
+demo = ["dep:ab_glyph"]
+
+[[example]]
+name = "record_demo"
+path = "examples/record_demo/main.rs"
+required-features = ["demo"]
+
+[dependencies]
+ab_glyph = { version = "0.2", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

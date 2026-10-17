@@ -1,0 +1,570 @@
+{
+ "snapshot": {
+  "version": "0.7.5",
+  "protocol": 18,
+  "focused_workspace_id": "w1",
+  "focused_tab_id": "w1:t3",
+  "focused_pane_id": "w1:p3",
+  "workspaces": [
+   {
+    "workspace_id": "w1",
+    "label": "atlas",
+    "number": 1,
+    "focused": true,
+    "active_tab_id": "w1:t1",
+    "agent_status": "working",
+    "tab_count": 9,
+    "pane_count": 10
+   },
+   {
+    "workspace_id": "w2",
+    "label": "harbor",
+    "number": 2,
+    "focused": false,
+    "active_tab_id": "w2:t1",
+    "agent_status": "blocked",
+    "tab_count": 5,
+    "pane_count": 6,
+    "worktree": {
+     "branch": "feat/retry-queue"
+    }
+   },
+   {
+    "workspace_id": "w3",
+    "label": "lumen",
+    "number": 3,
+    "focused": false,
+    "active_tab_id": "w3:t1",
+    "agent_status": "working",
+    "tab_count": 4,
+    "pane_count": 5,
+    "worktree": {
+     "branch": "feat/preview-tail"
+    }
+   }
+  ],
+  "tabs": [
+   {
+    "tab_id": "w1:t1",
+    "workspace_id": "w1",
+    "label": "server",
+    "number": 1,
+    "agent_status": "none",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w1:t2",
+    "workspace_id": "w1",
+    "label": "Redesign the invoice list empty state",
+    "number": 2,
+    "agent_status": "working",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w1:t3",
+    "workspace_id": "w1",
+    "label": "Check the receipt email copy",
+    "number": 3,
+    "agent_status": "working",
+    "pane_count": 1,
+    "focused": true
+   },
+   {
+    "tab_id": "w1:t4",
+    "workspace_id": "w1",
+    "label": "One formatter, or per surface?",
+    "number": 4,
+    "agent_status": "blocked",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w1:t5",
+    "workspace_id": "w1",
+    "label": "Rebuilt the index with the new analyzer",
+    "number": 5,
+    "agent_status": "done",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w1:t6",
+    "workspace_id": "w1",
+    "label": "logs",
+    "number": 6,
+    "agent_status": "none",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w1:t7",
+    "workspace_id": "w1",
+    "label": "Tighten the rate limit buckets",
+    "number": 7,
+    "agent_status": "working",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w1:t8",
+    "workspace_id": "w1",
+    "label": "The invoice cache ignores the timezone",
+    "number": 8,
+    "agent_status": "blocked",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w1:t9",
+    "workspace_id": "w1",
+    "label": "tests",
+    "number": 9,
+    "agent_status": "none",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w2:t1",
+    "workspace_id": "w2",
+    "label": "Cap the backoff, or drop after 8?",
+    "number": 1,
+    "agent_status": "blocked",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w2:t2",
+    "workspace_id": "w2",
+    "label": "alembic upgrade head",
+    "number": 2,
+    "agent_status": "idle",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w2:t3",
+    "workspace_id": "w2",
+    "label": "Drain the export queue",
+    "number": 3,
+    "agent_status": "working",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w2:t4",
+    "workspace_id": "w2",
+    "label": "psql",
+    "number": 4,
+    "agent_status": "none",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w2:t5",
+    "workspace_id": "w2",
+    "label": "Rewrite the webhook dedupe",
+    "number": 5,
+    "agent_status": "done",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w3:t1",
+    "workspace_id": "w3",
+    "label": "Tail the preview through the socket",
+    "number": 1,
+    "agent_status": "working",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w3:t2",
+    "workspace_id": "w3",
+    "label": "Chasing a flaky decoder test",
+    "number": 2,
+    "agent_status": "blocked",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w3:t3",
+    "workspace_id": "w3",
+    "label": "lint",
+    "number": 3,
+    "agent_status": "none",
+    "pane_count": 1,
+    "focused": false
+   },
+   {
+    "tab_id": "w3:t4",
+    "workspace_id": "w3",
+    "label": "Document the keyboard table",
+    "number": 4,
+    "agent_status": "working",
+    "pane_count": 1,
+    "focused": false
+   }
+  ],
+  "panes": [
+   {
+    "pane_id": "w1:p1",
+    "tab_id": "w1:t1",
+    "workspace_id": "w1",
+    "cwd": "/Users/dev/workspace/atlas",
+    "focused": false,
+    "label": "next dev"
+   },
+   {
+    "pane_id": "w1:p2",
+    "tab_id": "w1:t2",
+    "workspace_id": "w1",
+    "cwd": "/Users/dev/workspace/atlas",
+    "focused": false,
+    "agent": "claude",
+    "agent_status": "working",
+    "title": "Redesign the invoice list empty state"
+   },
+   {
+    "pane_id": "w1:p3",
+    "tab_id": "w1:t3",
+    "workspace_id": "w1",
+    "cwd": "/Users/dev/workspace/atlas",
+    "focused": true,
+    "agent": "claude",
+    "agent_status": "working",
+    "title": "Check the receipt email copy"
+   },
+   {
+    "pane_id": "w1:p4",
+    "tab_id": "w1:t4",
+    "workspace_id": "w1",
+    "cwd": "/Users/dev/workspace/atlas/web",
+    "focused": false,
+    "agent": "codex",
+    "agent_status": "blocked",
+    "title": "One formatter, or per surface?"
+   },
+   {
+    "pane_id": "w1:p5",
+    "tab_id": "w1:t5",
+    "workspace_id": "w1",
+    "cwd": "/Users/dev/workspace/atlas/.worktrees/search",
+    "focused": false,
+    "agent": "claude",
+    "agent_status": "done",
+    "title": "Rebuilt the index with the new analyzer"
+   },
+   {
+    "pane_id": "w1:p6",
+    "tab_id": "w1:t6",
+    "workspace_id": "w1",
+    "cwd": "/Users/dev/workspace/atlas",
+    "focused": false,
+    "label": "tail worker"
+   },
+   {
+    "pane_id": "w1:p7",
+    "tab_id": "w1:t7",
+    "workspace_id": "w1",
+    "cwd": "/Users/dev/workspace/atlas",
+    "focused": false,
+    "agent": "grok",
+    "agent_status": "working",
+    "title": "Tighten the rate limit buckets"
+   },
+   {
+    "pane_id": "w1:p8",
+    "tab_id": "w1:t8",
+    "workspace_id": "w1",
+    "cwd": "/Users/dev/workspace/atlas/api",
+    "focused": false,
+    "agent": "claude",
+    "agent_status": "blocked",
+    "title": "The invoice cache ignores the timezone"
+   },
+   {
+    "pane_id": "w1:p9",
+    "tab_id": "w1:t9",
+    "workspace_id": "w1",
+    "cwd": "/Users/dev/workspace/atlas",
+    "focused": false,
+    "label": "jest watch"
+   },
+   {
+    "pane_id": "w2:p1",
+    "tab_id": "w2:t1",
+    "workspace_id": "w2",
+    "cwd": "/Users/dev/workspace/harbor",
+    "focused": false,
+    "agent": "codex",
+    "agent_status": "blocked",
+    "title": "Cap the backoff, or drop after 8?"
+   },
+   {
+    "pane_id": "w2:p2",
+    "tab_id": "w2:t2",
+    "workspace_id": "w2",
+    "cwd": "/Users/dev/workspace/harbor",
+    "focused": false,
+    "agent": "gemini",
+    "agent_status": "idle",
+    "title": "alembic upgrade head"
+   },
+   {
+    "pane_id": "w2:p3",
+    "tab_id": "w2:t3",
+    "workspace_id": "w2",
+    "cwd": "/Users/dev/workspace/harbor",
+    "focused": false,
+    "agent": "kimi",
+    "agent_status": "working",
+    "title": "Drain the export queue"
+   },
+   {
+    "pane_id": "w2:p4",
+    "tab_id": "w2:t4",
+    "workspace_id": "w2",
+    "cwd": "/Users/dev/workspace/harbor",
+    "focused": false,
+    "label": "db"
+   },
+   {
+    "pane_id": "w2:p5",
+    "tab_id": "w2:t5",
+    "workspace_id": "w2",
+    "cwd": "/Users/dev/workspace/harbor",
+    "focused": false,
+    "agent": "codex",
+    "agent_status": "done",
+    "title": "Rewrite the webhook dedupe"
+   },
+   {
+    "pane_id": "w3:p1",
+    "tab_id": "w3:t1",
+    "workspace_id": "w3",
+    "cwd": "/Users/dev/workspace/lumen",
+    "focused": false,
+    "agent": "claude",
+    "agent_status": "working",
+    "title": "Tail the preview through the socket"
+   },
+   {
+    "pane_id": "w3:p2",
+    "tab_id": "w3:t2",
+    "workspace_id": "w3",
+    "cwd": "/Users/dev/workspace/lumen",
+    "focused": false,
+    "agent": "pi",
+    "agent_status": "blocked",
+    "title": "Chasing a flaky decoder test"
+   },
+   {
+    "pane_id": "w3:p3",
+    "tab_id": "w3:t3",
+    "workspace_id": "w3",
+    "cwd": "/Users/dev/workspace/lumen",
+    "focused": false
+   },
+   {
+    "pane_id": "w3:p4",
+    "tab_id": "w3:t4",
+    "workspace_id": "w3",
+    "cwd": "/Users/dev/workspace/lumen/docs",
+    "focused": false,
+    "agent": "gemini",
+    "agent_status": "working",
+    "title": "Document the keyboard table"
+   }
+  ],
+  "agents": [
+   {
+    "pane_id": "w1:p2",
+    "tab_id": "w1:t2",
+    "workspace_id": "w1",
+    "cwd": "/Users/dev/workspace/atlas",
+    "focused": false,
+    "agent": "claude",
+    "agent_status": "working",
+    "terminal_title_stripped": "Redesign the invoice list empty state"
+   },
+   {
+    "pane_id": "w1:p3",
+    "tab_id": "w1:t3",
+    "workspace_id": "w1",
+    "cwd": "/Users/dev/workspace/atlas",
+    "focused": true,
+    "agent": "claude",
+    "agent_status": "working",
+    "terminal_title_stripped": "Check the receipt email copy"
+   },
+   {
+    "pane_id": "w1:p4",
+    "tab_id": "w1:t4",
+    "workspace_id": "w1",
+    "cwd": "/Users/dev/workspace/atlas/web",
+    "focused": false,
+    "agent": "codex",
+    "agent_status": "blocked",
+    "terminal_title_stripped": "One formatter, or per surface?"
+   },
+   {
+    "pane_id": "w1:p5",
+    "tab_id": "w1:t5",
+    "workspace_id": "w1",
+    "cwd": "/Users/dev/workspace/atlas/.worktrees/search",
+    "focused": false,
+    "agent": "claude",
+    "agent_status": "done",
+    "terminal_title_stripped": "Rebuilt the index with the new analyzer",
+    "name": "indexer"
+   },
+   {
+    "pane_id": "w1:p7",
+    "tab_id": "w1:t7",
+    "workspace_id": "w1",
+    "cwd": "/Users/dev/workspace/atlas",
+    "focused": false,
+    "agent": "grok",
+    "agent_status": "working",
+    "terminal_title_stripped": "Tighten the rate limit buckets"
+   },
+   {
+    "pane_id": "w1:p8",
+    "tab_id": "w1:t8",
+    "workspace_id": "w1",
+    "cwd": "/Users/dev/workspace/atlas/api",
+    "focused": false,
+    "agent": "claude",
+    "agent_status": "blocked",
+    "terminal_title_stripped": "The invoice cache ignores the timezone"
+   },
+   {
+    "pane_id": "w2:p1",
+    "tab_id": "w2:t1",
+    "workspace_id": "w2",
+    "cwd": "/Users/dev/workspace/harbor",
+    "focused": false,
+    "agent": "codex",
+    "agent_status": "blocked",
+    "terminal_title_stripped": "Cap the backoff, or drop after 8?"
+   },
+   {
+    "pane_id": "w2:p2",
+    "tab_id": "w2:t2",
+    "workspace_id": "w2",
+    "cwd": "/Users/dev/workspace/harbor",
+    "focused": false,
+    "agent": "gemini",
+    "agent_status": "idle",
+    "terminal_title_stripped": "alembic upgrade head"
+   },
+   {
+    "pane_id": "w2:p3",
+    "tab_id": "w2:t3",
+    "workspace_id": "w2",
+    "cwd": "/Users/dev/workspace/harbor",
+    "focused": false,
+    "agent": "kimi",
+    "agent_status": "working",
+    "terminal_title_stripped": "Drain the export queue",
+    "name": "backfill"
+   },
+   {
+    "pane_id": "w2:p5",
+    "tab_id": "w2:t5",
+    "workspace_id": "w2",
+    "cwd": "/Users/dev/workspace/harbor",
+    "focused": false,
+    "agent": "codex",
+    "agent_status": "done",
+    "terminal_title_stripped": "Rewrite the webhook dedupe"
+   },
+   {
+    "pane_id": "w3:p1",
+    "tab_id": "w3:t1",
+    "workspace_id": "w3",
+    "cwd": "/Users/dev/workspace/lumen",
+    "focused": false,
+    "agent": "claude",
+    "agent_status": "working",
+    "terminal_title_stripped": "Tail the preview through the socket"
+   },
+   {
+    "pane_id": "w3:p2",
+    "tab_id": "w3:t2",
+    "workspace_id": "w3",
+    "cwd": "/Users/dev/workspace/lumen",
+    "focused": false,
+    "agent": "pi",
+    "agent_status": "blocked",
+    "terminal_title_stripped": "Chasing a flaky decoder test"
+   },
+   {
+    "pane_id": "w3:p4",
+    "tab_id": "w3:t4",
+    "workspace_id": "w3",
+    "cwd": "/Users/dev/workspace/lumen/docs",
+    "focused": false,
+    "agent": "gemini",
+    "agent_status": "working",
+    "terminal_title_stripped": "Document the keyboard table"
+   }
+  ],
+  "layouts": []
+ },
+ "recents": [
+  "w2:p1",
+  "w1:p4",
+  "w3:p2"
+ ],
+ "ages": {
+  "w1:p1": 15120,
+  "w1:p2": 3060,
+  "w1:p3": 500,
+  "w1:p4": 7440,
+  "w1:p5": 2220,
+  "w1:p6": 15060,
+  "w1:p7": 1320,
+  "w1:p8": 12360,
+  "w1:p9": 96,
+  "w2:p1": 20880,
+  "w2:p2": 1260,
+  "w2:p3": 840,
+  "w2:p4": 3780,
+  "w2:p5": 9600,
+  "w3:p1": 540,
+  "w3:p2": 2820,
+  "w3:p3": 12,
+  "w3:p4": 4680
+ },
+ "previews": {
+  "w1:p1": "▲ dev server · http://localhost:3000\n  ✓ ready in 1.4s\n\n  ○ compiling /invoices/[id] ...\n  ✓ compiled /invoices/[id] in 812ms (1918 modules)\n  GET /invoices/inv_8842 200 in 94ms\n",
+  "w1:p2": "● Working · atlas\n  Capacity: 3/32 · 4m 12s\n\n> the empty state flashes before the rows land\n\n⏺ Editing src/components/InvoiceSkeleton.tsx\n  Holding the skeleton until the query settles.\n",
+  "w1:p3": "● Working · atlas\n  Capacity: 3/32 · 40s\n\n> does the receipt email still say \"no charges\"?\n\n⏺ Reading src/email/ReceiptSummary.tsx …\n  Two branches render the empty copy. Checking both.\n",
+  "w1:p4": "◉ Needs you · atlas/web\n  Waiting on input · 2m 08s\n\n⏺ The checkout summary is assembled in three places.\n\n  Do you want one shared formatter, or copy tuned\n  per surface? (1) shared  (2) per surface\n",
+  "w1:p5": "● Done · search\n  Finished · 6m 51s\n\n⏺ Rebuilt the index with the new analyzer chain.\n  12 files changed, 318 insertions(+), 44 deletions(-)\n\n  All 84 tests pass. Ready for review.\n",
+  "w1:p6": "14:02:11  INFO   sync.pull   invoices=18 window=7d\n14:02:11  INFO   cache.get   miss key=inv:2026-07\n14:02:12  WARN   db.query    slow query 812ms\n14:02:12  INFO   billing     totals recomputed account=1\n14:02:13  INFO   http        GET /api/invoices 200 94ms\n",
+  "w1:p7": "● Working · atlas\n  Capacity: 3/32 · 1m 33s\n\n> the per-key limit is too low for batch importers\n\n⏺ Rewriting the bucket table in lib/ratelimit.ts\n  Adding a burst allowance behind a flag.\n",
+  "w1:p8": "◉ Needs you · atlas/api\n  Waiting on input · 8m 44s\n\n⏺ The invoice cache key ignores the timezone, so a\n  Sunday-evening request serves Saturday's totals.\n\n  Fix the key, or invalidate on tz change?\n",
+  "w1:p9": "  PASS  src/lib/ratelimit.test.ts\n  PASS  src/lib/invoice.test.ts\n  FAIL  src/components/InvoiceList.test.tsx\n\n  ● renders the summary › with no invoices\n    expected \"nothing due\" to be in the document\n",
+  "w2:p1": "◉ Needs you · harbor\n  Waiting on input · 12m 03s\n\n⏺ Backoff is exponential but unbounded -- a dead\n  webhook retries for 14 hours.\n\n  Cap at 30 minutes, or drop after 8 attempts?\n",
+  "w2:p2": "✓ Idle · harbor\n  Ready · last ran 21m ago\n\n  alembic upgrade head\n  INFO  [alembic.runtime.migration] Running upgrade\n        4f21a0 -> 9c1b7e, add dedupe index\n",
+  "w2:p3": "● Working · harbor\n  Capacity: 1/32 · 3m 07s\n\n> drain the exports we dropped last Tuesday\n\n⏺ Streaming 4,812 records in pages of 200 …\n  page 12/25 · 2,400 written · 0 errors\n",
+  "w2:p4": "harbor=# select count(*) from webhook_delivery\nharbor-#   where status = 'pending';\n count\n-------\n  1284\n(1 row)\n",
+  "w2:p5": "● Done · harbor\n  Finished · 22m 18s\n\n⏺ Dedupe now keys on (source, external_id) with a\n  partial unique index, so replays are free.\n\n  6 files changed. Migration 9c1b7e added.\n",
+  "w3:p1": "● Working · lumen\n  Capacity: 2/32 · 55s\n\n> the preview should tail, not snapshot\n\n⏺ Editing src/lumen/panel.py\n  Debouncing reads at 70ms and caching for 1.5s.\n",
+  "w3:p2": "◉ Needs you · lumen\n  Waiting on input · 4m 30s\n\n⏺ test_keys.py::test_paste_bracket fails only when\n  the decoder is fed one byte at a time.\n\n  Is a split paste marker worth supporting?\n",
+  "w3:p3": "$ lint src tests\nAll checks passed!\n\n$ python3 -m pytest -q\n84 passed in 1.09s\n",
+  "w3:p4": "● Working · lumen/docs\n  Capacity: 2/32 · 2m 41s\n\n> the keyboard table is missing the mouse row\n\n⏺ Editing docs/keyboard.md\n  Adding wheel, click-to-select and click-to-jump.\n"
+ },
+ "fallback_preview": "$ herdr status\n  3 workspaces · 18 tabs · 21 panes\n",
+ "previews_after": [
+  {
+   "pane_id": "w1:p7",
+   "status": "blocked",
+   "text": "◉ Needs you · atlas\n  Waiting on input · 1m 58s\n\n⏺ A burst allowance needs a plan tier, and the\n  free tier has no ceiling today.\n\n  Cap the free tier, or leave it unlimited?\n"
+  }
+ ]
+}

@@ -18,7 +18,6 @@ quick switcher, for the terminal.
   font installed, vendor logos lead each agent row, as shown in the demo.
 - **optional status in the tab bar** — agent tabs lead with their logo and status,
   updated only when the status changes.
-
 - **fuzzy search over everything you can jump to** — agents, plain tabs, and
   workspaces, matched on title, working directory, agent name and kind, branch,
   workspace, and tab number.
@@ -38,7 +37,9 @@ quick switcher, for the terminal.
   session you are looking at is the session you can tidy.
 - **one small native binary** — written in Rust, no runtime to install. Herdr
   downloads the prebuilt binary for your platform when it installs the plugin.
-  A small background watcher runs when tab updates are enabled.
+  On a session with 2,000 rows, the first frame takes about 24 ms and a
+  keystroke about 10 ms (p99). A small background watcher runs when tab
+  updates are enabled.
 
 ## Install
 
@@ -65,6 +66,12 @@ older, so there is nothing to get wrong. Installing runs the plugin's build
 step, which downloads the release binary for your platform and checks it
 against the release's `SHA256SUMS`; if that fails, it builds from source with
 `cargo` instead (Rust 1.88+). Set `HERDR_BAR_BUILD=source` to always build from source.
+
+**Upgrading from 0.8 or older.** The old Python title watcher keeps running
+after the upgrade, and tab titles stop updating. Run
+`herdr plugin action invoke herdr-bar.stop-titles`, then
+`herdr plugin action invoke herdr-bar.start-titles`, once. Restarting herdr is
+not enough, because the old watcher survives a server restart.
 
 **Windows.** Bind `command = "herdr-bar.open-windows"` instead of
 `herdr-bar.open`: `open` is a shell one-liner, and Windows has no `sh`.
@@ -227,9 +234,6 @@ unknown. With several agents in one tab, the most urgent one leads.
   prefixes the watcher still owns. `tab_status` does not control task naming:
   set `"auto_titles": false` as well to disable all automatic tab updates.
 
-As of 0.7.0, working indicators are static in both the popup and tab labels.
-Existing `spinner` and `tab_flash` settings are ignored and can be removed.
-
 Herdr tab labels are plain text, so the status is part of the label: other
 tools reading tab names see the prefix, and the bar strips it from its own rows.
 Herdr cannot hand a renamed tab back its automatic number, so an unnamed tab
@@ -382,7 +386,7 @@ invocation with `herdr plugin pane open --plugin herdr-bar --entrypoint bar
 ## How it works
 
 The bar is one short-lived process in a herdr popup pane. It reads the whole
-session in a single `session.snapshot` call over herdr's socket (~15ms; a Unix
+session in a single `session.snapshot` call over herdr's socket (a Unix
 socket, or the named pipe herdr serves under the same path on Windows),
 re-reads it while it is open so statuses stay live, tails the selected pane with
 `pane.read` for the preview, and calls `tab.focus`, `pane.focus`, `agent.focus`,
@@ -438,6 +442,12 @@ against a fake herdr. It compares every screen, the bytes each repaint costs,
 every herdr request and every state file with transcripts recorded from the
 Python release (`tests/parity/golden.json`). None of it needs a herdr server.
 When a UI change is intended, bless the golden and review its diff.
+
+The README demo is recorded from the real binary, on a pseudo-terminal against
+a fake herdr session, in real time. `cargo run --release --features demo
+--example record_demo` writes `demo/herdr-bar.gif` and `demo/herdr-bar.mp4`
+(needs `ffmpeg`, and the Herdr Agent Icons Max font for the logos); copy the
+GIF to `assets/demo.gif`. The `demo` feature is never part of the plugin build.
 `herdr plugin log list --plugin herdr-bar` shows what herdr recorded when it
 launched the plugin.
 
