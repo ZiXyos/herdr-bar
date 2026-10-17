@@ -73,11 +73,9 @@ after the upgrade, and tab titles stop updating. Run
 `herdr plugin action invoke herdr-bar.start-titles`, once. Restarting herdr is
 not enough, because the old watcher survives a server restart.
 
-**Windows.** Bind `command = "herdr-bar.open-windows"` instead of
-`herdr-bar.open`: `open` is a shell one-liner, and Windows has no `sh`.
-The build step runs in Windows PowerShell. Everything works on Windows, with one
-difference: tab status glyphs follow the watcher's two-second poll instead of
-an event stream. Tested on Windows 11 with herdr 0.9.3 in Windows Terminal.
+**Windows.** The build step runs in Windows PowerShell. Everything works on
+Windows, with one difference: tab status glyphs follow the watcher's
+two-second poll instead of an event stream. Tested on Windows 11 with herdr 0.9.3 in Windows Terminal.
 
 ## Automatic tab updates
 

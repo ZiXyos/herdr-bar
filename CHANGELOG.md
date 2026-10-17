@@ -8,6 +8,10 @@
   everything. Any other value falls back to `"all"`.
 - Add `select_current` (default `false`) to open with the row you are in
   selected instead of the one you came from (#19). The order does not change.
+- `herdr-bar.open` works on Windows too, so one keybinding works on every
+  platform. The action runs the binary's `--open` instead of an `sh`
+  one-liner. `herdr-bar.open-windows` still works on Windows, for configs
+  that bind it.
 
 ## 0.9.1
 

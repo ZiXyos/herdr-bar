@@ -1,8 +1,7 @@
-//! Open the bar's popup through the Herdr CLI: what `open-windows` runs.
+//! Open the bar's popup through the Herdr CLI: what the `open` action runs.
 //!
-//! Herdr starts manifest commands without a shell, and Windows has no `sh`
-//! for the one-liner behind `open`, so Windows has its own action and the CLI
-//! call lives here.
+//! Herdr starts manifest commands without a shell, and Windows has no `sh`,
+//! so the CLI call lives in the binary and one action works on every platform.
 
 pub const POPUP_ARGS: &[&str] =
     &["plugin", "pane", "open", "--plugin", "herdr-bar", "--entrypoint", "bar", "--placement", "popup"];

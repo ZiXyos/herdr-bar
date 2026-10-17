@@ -22,25 +22,18 @@ platforms = ["linux", "macos"]
 command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/install.ps1"]
 platforms = ["windows"]
 
-# Opening the bar is a one-liner through the Herdr CLI, so the action stays a
-# shell exec instead of starting the plugin binary just to start Herdr's.
-# HERDR_BIN_PATH can outlive the binary it points at when Herdr is upgraded
-# under a running server, so fall back to whatever is on PATH.
+# One action for every platform, so one keybinding works everywhere. Herdr
+# starts manifest commands without a shell and Windows has no `sh`, so the
+# binary opens the popup itself (`--open`). On Windows, install.ps1 puts
+# bin\herdr-bar beside bin\herdr-bar.exe, as for the bar pane.
 [[actions]]
 id = "open"
 title = "Open bar"
 description = "Fuzzy-jump to any tab, pane, or agent"
 contexts = ["global"]
-platforms = ["linux", "macos"]
-command = [
-  "sh",
-  "-c",
-  'herdr_bin="${HERDR_BIN_PATH:-herdr}"; [ -x "$herdr_bin" ] || herdr_bin=herdr; exec "$herdr_bin" plugin pane open --plugin herdr-bar --entrypoint bar --placement popup',
-]
+command = ["bin/herdr-bar", "--open"]
 
-# Windows has no `sh`, and Herdr rejects a second `open` action even with a
-# different `platforms` list, so Windows gets its own id. The same one-liner
-# lives in the binary's --open.
+# Kept so that Windows configs from 0.8 and 0.9 that bind it still work.
 [[actions]]
 id = "open-windows"
 title = "Open bar"
