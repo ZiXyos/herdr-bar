@@ -27,6 +27,8 @@ pub struct Config {
     pub running_time: bool,
     /// The filter the bar opens with: one of `SCOPES`, "all" unless set.
     pub scope: &'static str,
+    /// Open with the row you are in selected, not the one you came from.
+    pub select_current: bool,
 }
 
 /// Python's `int(value)` for whatever JSON put there; None where it raises.
@@ -94,6 +96,7 @@ impl Config {
                 .and_then(|v| v.as_str())
                 .and_then(|name| SCOPES.iter().copied().find(|scope| *scope == name))
                 .unwrap_or("all"),
+            select_current: get("select_current").map(|v| v.is_true()).unwrap_or(false),
         }
     }
 
@@ -168,6 +171,15 @@ mod tests {
         }
         for value in ["\"agents\"", "\"Agent\"", "\"@\"", "\"\"", "1", "true", "null", "[\"agent\"]"] {
             assert_eq!(with("scope", value).scope, "all", "scope = {}", value);
+        }
+    }
+
+    #[test]
+    fn select_current_takes_only_true() {
+        assert!(!Config::default().select_current);
+        assert!(with("select_current", "true").select_current);
+        for value in ["false", "\"true\"", "1", "null"] {
+            assert!(!with("select_current", value).select_current, "select_current = {}", value);
         }
     }
 }
