@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.0
 
 - Add `follow_new_sessions` (default `false`) to let the next Claude or Codex
   session in a pane take over the task title written for the one before it,
