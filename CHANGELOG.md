@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
 
 - Add `scope` (default `"all"`) to open the bar on a filter: `"agent"`,
   `"pane"`, `"tab"` or `"blocked"` (#17). `backspace` on an empty query still
