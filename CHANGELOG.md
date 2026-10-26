@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.12.0
 
 - Add `actions` (default `false`) to list plugin actions as rows (#23): Enter
   runs the action, and `>` on an empty query filters to them. Actions of
