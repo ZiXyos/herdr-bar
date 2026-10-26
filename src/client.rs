@@ -378,6 +378,42 @@ impl HerdrClient {
         self.call("agent.focus", dict(&[("target", Value::str(target))]), &["agent", "focus", target]).map(|_| ())
     }
 
+    /// Every action of every installed plugin, as `plugin.action.list` gives them.
+    pub fn plugin_actions(&mut self) -> Result<Vec<Value>> {
+        let mut result = self.call("plugin.action.list", dict(&[]), &["plugin", "action", "list"])?;
+        match result.remove("actions") {
+            Some(Value::List(actions)) => Ok(actions),
+            _ => Err(HerdrError::new("plugin.action.list did not return an action list")),
+        }
+    }
+
+    /// Start a plugin action. Herdr fills its context from the focused tab
+    /// and pane, which a popup leaves where they were.
+    pub fn invoke_action(&mut self, plugin_id: &str, action_id: &str) -> Result<()> {
+        self.call(
+            "plugin.action.invoke",
+            dict(&[("plugin_id", Value::str(plugin_id)), ("action_id", Value::str(action_id))]),
+            &["plugin", "action", "invoke", action_id, "--plugin", plugin_id],
+        )
+        .map(|_| ())
+    }
+
+    /// Close the open popup. The CLI has no such command; without the socket
+    /// the popup closes when the bar exits, a moment later.
+    pub fn close_popup(&mut self) -> Result<()> {
+        if !self.socket_ok {
+            return Ok(());
+        }
+        match self.socket_call("popup.close", &dict(&[])) {
+            Ok(response) => HerdrClient::unwrap(response).map(|_| ()),
+            Err(Transport::Herdr(error)) => Err(error),
+            Err(_) => {
+                self.socket_ok = false;
+                Ok(())
+            }
+        }
+    }
+
     /// The CLI's `pane focus` only moves by direction, so this call has no
     /// CLI form. Over the fallback transport the tab focus that jump() does
     /// first already lands on the right tab, so a missing socket degrades to
@@ -731,6 +767,39 @@ mod tests {
     }
 
     #[test]
+    fn action_calls_send_the_documented_params() {
+        let _env = testutil::env_lock();
+        let path = testutil::socket_path();
+        let requests = serve(&path, |request| {
+            let id = request.get("id").clone();
+            let result = match request.get("method").as_str() {
+                Some("plugin.action.list") => params(
+                    r#"{"type": "plugin_action_list", "actions": [{"plugin_id": "p", "action_id": "a", "title": "A"}]}"#,
+                ),
+                _ => dict(&[("type", Value::str("ok"))]),
+            };
+            Some(dict(&[("id", id), ("result", result)]))
+        });
+        let mut client = client(&path, "/nonexistent");
+        let actions = client.plugin_actions().unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].get("title"), &Value::str("A"));
+        client.invoke_action("herdr-servers", "open").unwrap();
+        client.close_popup().unwrap();
+        let seen: Vec<(Value, Value)> =
+            requests.lock().unwrap().iter().map(|r| (r.get("method").clone(), r.get("params").clone())).collect();
+        assert_eq!(
+            seen,
+            vec![
+                (Value::str("plugin.action.list"), params("{}")),
+                (Value::str("plugin.action.invoke"), params(r#"{"plugin_id": "herdr-servers", "action_id": "open"}"#)),
+                (Value::str("popup.close"), params("{}")),
+            ]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn server_errors_become_herdr_errors() {
         fn failing(request: &Value) -> Option<Value> {
             Some(dict(&[("id", request.get("id").clone()), ("error", params(r#"{"code": "not_found", "message": "no such tab"}"#))]))
@@ -824,6 +893,15 @@ mod tests {
         let error = client.snapshot().unwrap_err();
         assert!(error.is_herdr());
         assert!(error.message.contains("not found"), "{}", error);
+    }
+
+    #[test]
+    fn close_popup_degrades_to_a_no_op_over_the_cli() {
+        // The CLI has no popup command; the popup closes when the bar exits.
+        let _env = testutil::env_lock();
+        let dir = TempDir::new();
+        let mut client = client(&dir.path().join("absent.sock"), "/nonexistent/herdr");
+        assert!(client.close_popup().is_ok());
     }
 
     #[test]

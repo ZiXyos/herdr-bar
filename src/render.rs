@@ -8,7 +8,7 @@
 
 use crate::age::format_age;
 use crate::icons;
-use crate::items::{Item, KIND_PANE, KIND_SPACE};
+use crate::items::{Item, KIND_ACTION, KIND_PANE, KIND_SPACE};
 use crate::pyos;
 use crate::pystr;
 use crate::textutil::{display_width, pad, truncate, truncate_middle, window_positions};
@@ -288,6 +288,8 @@ pub fn render_row(
         meta.push(chunk("muted", "space", &field_marks(item, row, "space", 0)));
     } else if item.kind == KIND_PANE {
         meta.push(chunk("muted", "pane", &field_marks(item, row, "pane", 0)));
+    } else if item.kind == KIND_ACTION {
+        meta.push(chunk("muted", "action", &field_marks(item, row, "action", 0)));
     }
 
     let fixed = plain_width(&leading);
@@ -537,6 +539,9 @@ pub fn render_preview(
         return Vec::new();
     }
     let Some(item) = item else { return vec![String::new(); height as usize] };
+    if item.kind == KIND_ACTION {
+        return render_action_preview(theme, item, width, height);
+    }
     let mut out: Vec<String> = Vec::new();
     let mut header = vec![Segment::bold("text", truncate(&item.title, width), true)];
     let room = width - plain_width(&header) - display_width(DETAIL_SEP) as isize;
@@ -575,6 +580,45 @@ pub fn render_preview(
     }
     out.truncate(height as usize);
     out
+}
+
+/// An action has nothing to tail: its name, the id a keybinding would use,
+/// and what it says it does, from the top.
+fn render_action_preview(theme: &Theme, item: &Item, width: isize, height: isize) -> Vec<String> {
+    let qualified = item.plugin_action.as_ref().map(|(plugin, action)| format!("{}.{}", plugin, action)).unwrap_or_default();
+    let mut out = vec![
+        segments_to_text(theme, &[Segment::bold("text", truncate(&item.title, width), true)], ""),
+        segments_to_text(theme, &[Segment::new("muted", truncate_middle(&qualified, width))], ""),
+        segments_to_text(theme, &[Segment::new("unknown", "─".repeat(width as usize))], ""),
+    ];
+    let body = if item.detail.is_empty() { vec!["no description".to_string()] } else { wrap(&item.detail, width) };
+    for line in body {
+        out.push(segments_to_text(theme, &[Segment::new("muted", truncate(&line, width))], ""));
+    }
+    out.resize(height as usize, String::new());
+    out
+}
+
+/// `text` in lines of at most `width` columns, broken between words where
+/// it can be.
+fn wrap(text: &str, width: isize) -> Vec<String> {
+    let width = width.max(1) as usize;
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && display_width(&line) + 1 + display_width(word) > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+        // A word wider than the line goes on its own and gets truncated.
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Row index -> scrollbar glyph for the visible window.

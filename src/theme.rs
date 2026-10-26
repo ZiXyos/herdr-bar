@@ -62,6 +62,7 @@ pub fn status_glyph(status: &str) -> &'static str {
         "done" => "●",
         "idle" => "✓",
         "none" => "·",
+        "action" => "›",
         _ => "○",
     }
 }

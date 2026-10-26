@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Add `actions` (default `false`) to list plugin actions as rows (#23): Enter
+  runs the action, and `>` on an empty query filters to them. Actions of
+  disabled plugins and other platforms, the bar's own open action and
+  selection-only actions stay out. The action gets the tab and pane you came
+  from as its context, and the bar's popup closes right after the invoke, so
+  an action that opens a popup of its own is not refused.
+
 ## 0.11.0
 
 - Add `follow_new_sessions` (default `false`) to let the next Claude or Codex

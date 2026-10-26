@@ -1,11 +1,11 @@
 //! Command line entry point.
 
-use crate::app::{jump, Bar, Pool};
+use crate::app::{in_popup, jump, load_actions, run_action, Bar, Pool};
 use crate::client::HerdrClient;
 use crate::config::Config;
 use crate::host;
 use crate::icons;
-use crate::items::build_items;
+use crate::items::{build_items, KIND_ACTION};
 use crate::mru::Recents;
 use crate::opener::open_bar;
 use crate::pyjson::{self, Map, Value};
@@ -127,6 +127,9 @@ fn doctor(client: &mut HerdrClient, config: &Config) -> i32 {
         count(snapshot.get("tabs")),
         count(snapshot.get("agents")),
     ));
+    if config.actions {
+        lines.push(format!("action rows      {}", load_actions(client).len()));
+    }
     out(&(lines.join("\n") + "\n"));
     0
 }
@@ -225,6 +228,11 @@ pub fn main(args: Vec<String>) -> i32 {
         icons::prefetch();
     }
     let fetch_config = config.clone();
+    // The plugin actions, when asked for, are a third read of their own.
+    let actions = config.actions.then(|| {
+        let mut client = client.clone();
+        std::thread::spawn(move || load_actions(&mut client))
+    });
     // The answer comes back over a channel so the thread can go on to free
     // the parsed snapshot while the bar draws.
     let (fetched, fetch) = std::sync::mpsc::channel();
@@ -258,6 +266,9 @@ pub fn main(args: Vec<String>) -> i32 {
     // rows one by one would only delay the exit (Bar owns nothing to flush).
     let mut bar = std::mem::ManuallyDrop::new(Bar::new(client, config, Recents::new(None), theme));
     std::mem::swap(&mut bar.recents, &mut recents);
+    if let Some(actions) = actions {
+        bar.actions = actions.join().unwrap_or_default();
+    }
     if let Err(error) = bar.bootstrap(pool, answer) {
         return fail(&error.message);
     }
@@ -272,6 +283,13 @@ pub fn main(args: Vec<String>) -> i32 {
 
     let Some(chosen) = chosen else { return 0 };
     let item = bar.pool[chosen].clone();
+    if item.kind == KIND_ACTION {
+        // Recents stay as they were: an action is not a place to come back to.
+        return match run_action(&mut bar.client, &item, in_popup()) {
+            Ok(()) => 0,
+            Err(error) => fail(&error.message),
+        };
+    }
     if let Err(error) = jump(&mut bar.client, &item) {
         return fail(&error.message);
     }

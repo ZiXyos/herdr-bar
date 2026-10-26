@@ -32,6 +32,8 @@ pub struct Config {
     /// Let the next session in a pane take over the task title written for
     /// the one before it.
     pub follow_new_sessions: bool,
+    /// List plugin actions as rows the bar can run.
+    pub actions: bool,
 }
 
 /// Python's `int(value)` for whatever JSON put there; None where it raises.
@@ -78,6 +80,7 @@ impl Config {
             None => 900,
             Some(value) => py_int(value).map(|v| v.max(200)).unwrap_or(900),
         };
+        let actions = get("actions").map(|v| v.is_true()).unwrap_or(false);
         Config {
             preview: or("preview", Value::str("auto")),
             mouse: get("mouse").map(|v| v.truthy()).unwrap_or(true),
@@ -98,9 +101,12 @@ impl Config {
             scope: get("scope")
                 .and_then(|v| v.as_str())
                 .and_then(|name| SCOPES.iter().copied().find(|scope| *scope == name))
+                // The action filter is empty without the action rows.
+                .filter(|scope| *scope != "action" || actions)
                 .unwrap_or("all"),
             select_current: get("select_current").map(|v| v.is_true()).unwrap_or(false),
             follow_new_sessions: get("follow_new_sessions").map(|v| v.is_true()).unwrap_or(false),
+            actions,
         }
     }
 
@@ -170,7 +176,7 @@ mod tests {
     #[test]
     fn scope_takes_the_filter_names_and_falls_back_to_all() {
         assert_eq!(Config::default().scope, "all");
-        for name in SCOPES {
+        for name in SCOPES.iter().filter(|name| **name != "action") {
             assert_eq!(with("scope", &format!("\"{}\"", name)).scope, *name);
         }
         for value in ["\"agents\"", "\"Agent\"", "\"@\"", "\"\"", "1", "true", "null", "[\"agent\"]"] {
@@ -193,6 +199,23 @@ mod tests {
         assert!(with("follow_new_sessions", "true").follow_new_sessions);
         for value in ["false", "\"true\"", "1", "null"] {
             assert!(!with("follow_new_sessions", value).follow_new_sessions, "follow_new_sessions = {}", value);
+        }
+    }
+
+    #[test]
+    fn the_action_scope_needs_the_action_rows() {
+        let config = |text: &str| Config::from_values(pyjson::loads(text).unwrap().as_dict().unwrap());
+        assert_eq!(config(r#"{"scope": "action"}"#).scope, "all");
+        assert_eq!(config(r#"{"scope": "action", "actions": false}"#).scope, "all");
+        assert_eq!(config(r#"{"scope": "action", "actions": true}"#).scope, "action");
+    }
+
+    #[test]
+    fn actions_takes_only_true() {
+        assert!(!Config::default().actions);
+        assert!(with("actions", "true").actions);
+        for value in ["false", "\"true\"", "1", "null"] {
+            assert!(!with("actions", value).actions, "actions = {}", value);
         }
     }
 }

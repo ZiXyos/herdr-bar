@@ -3,7 +3,8 @@
 //! The rule is one row per agent, plus one row per tab that has no agent,
 //! plus one row per workspace once a session has more than one. Named pane
 //! rows are built separately for the dedicated pane filter, where duplicating
-//! those higher-level rows is intentional.
+//! those higher-level rows is intentional. Plugin action rows, when the
+//! config asks for them, come from Herdr's plugin list instead.
 
 use crate::fuzzy::Prepared;
 use crate::pyjson::{self, Value};
@@ -16,6 +17,16 @@ pub const KIND_AGENT: &str = "agent";
 pub const KIND_PANE: &str = "pane";
 pub const KIND_TAB: &str = "tab";
 pub const KIND_SPACE: &str = "space";
+pub const KIND_ACTION: &str = "action";
+
+/// This build's platform, as plugin manifests name it.
+pub const PLATFORM: &str = if cfg!(windows) {
+    "windows"
+} else if cfg!(target_os = "macos") {
+    "macos"
+} else {
+    "linux"
+};
 
 pub fn status_order(status: &str) -> i64 {
     match status {
@@ -49,6 +60,8 @@ pub struct Item {
     pub fields: Vec<String>,
     pub prepared: Vec<Prepared>,
     pub detail_field: isize,
+    /// The plugin and action ids an action row invokes.
+    pub plugin_action: Option<(String, String)>,
 }
 
 pub struct ItemInit {
@@ -118,6 +131,7 @@ impl Item {
             fields,
             prepared,
             detail_field,
+            plugin_action: None,
         }
     }
 
@@ -565,6 +579,62 @@ pub fn build_pane_items(snapshot: &Value) -> Vec<Item> {
     })
 }
 
+/// One row per plugin action the bar can run.
+///
+/// `actions` is what `plugin.action.list` returned and `enabled` the plugin
+/// ids `plugin.list` reports enabled, or None when it could not say. Herdr
+/// refuses actions of disabled plugins and of other platforms, so those stay
+/// out; so do the bar's own open actions, since the bar is already open, and
+/// actions offered only on a text selection, which the bar never has.
+pub fn build_action_items(actions: &[Value], enabled: Option<&[String]>, platform: &str) -> Vec<Item> {
+    let mut items = Vec::new();
+    for action in actions {
+        let plugin_id = clean(action.get("plugin_id"));
+        let action_id = clean(action.get("action_id"));
+        let title = clean(action.get("title"));
+        if plugin_id.is_empty() || action_id.is_empty() || title.is_empty() {
+            continue;
+        }
+        if enabled.is_some_and(|enabled| !enabled.contains(&plugin_id)) {
+            continue;
+        }
+        if plugin_id == "herdr-bar" && (action_id == "open" || action_id == "open-windows") {
+            continue;
+        }
+        // No list means every platform the plugin runs on, as in Herdr.
+        if let Value::List(platforms) = action.get("platforms") {
+            if !platforms.iter().any(|p| p.as_str() == Some(platform)) {
+                continue;
+            }
+        }
+        let contexts = action.get("contexts").list_or_empty();
+        if !contexts.is_empty() && contexts.iter().all(|c| c.as_str() == Some("selection")) {
+            continue;
+        }
+        let qualified = format!("{}.{}", plugin_id, action_id);
+        let mut item = Item::new(ItemInit {
+            kind: KIND_ACTION,
+            key: format!("action:{}", qualified),
+            title,
+            detail: clean(action.get("description")),
+            subtitle: plugin_id.clone(),
+            workspace_id: String::new(),
+            workspace_label: String::new(),
+            tab_id: None,
+            pane_id: None,
+            agent: None,
+            agent_name: None,
+            status: KIND_ACTION.into(),
+            tab_number: None,
+            focused: false,
+            extra_terms: vec![qualified],
+        });
+        item.plugin_action = Some((plugin_id, action_id));
+        items.push(item);
+    }
+    items
+}
+
 #[cfg(test)]
 mod tests {
     // Ported from the Python release's tests/test_items.py.
@@ -762,5 +832,76 @@ mod tests {
     fn handles_missing_values() {
         let _env = testutil::env_lock();
         assert_eq!(shorten_path(""), "");
+    }
+
+    fn actions() -> Vec<Value> {
+        pyjson::loads(
+            r#"[
+                {"plugin_id": "herdr-servers", "action_id": "open", "title": "Open servers",
+                 "description": "Every dev server running", "contexts": ["global"], "platforms": ["linux", "macos", "windows"]},
+                {"plugin_id": "herdr-servers", "action_id": "doctor", "title": "Check servers setup"},
+                {"plugin_id": "viewer", "action_id": "open-elsewhere", "title": "Open file viewer", "platforms": ["plan9"]},
+                {"plugin_id": "herdr-bar", "action_id": "open", "title": "Open bar"},
+                {"plugin_id": "herdr-bar", "action_id": "open-windows", "title": "Open bar", "platforms": ["windows"]},
+                {"plugin_id": "herdr-bar", "action_id": "stop-titles", "title": "Stop tab watcher"},
+                {"plugin_id": "herdr-swarm", "action_id": "session", "title": "Swarm session", "contexts": ["pane"]},
+                {"plugin_id": "clipper", "action_id": "copy", "title": "Copy selection", "contexts": ["selection"]},
+                {"plugin_id": "clipper", "action_id": "paste", "title": "Paste", "contexts": ["selection", "global"]},
+                {"plugin_id": "off", "action_id": "go", "title": "Disabled thing"},
+                {"plugin_id": "untitled", "action_id": "x", "title": "  "}
+            ]"#,
+        )
+        .unwrap()
+        .list_or_empty()
+        .to_vec()
+    }
+
+    fn action_keys(enabled: Option<&[String]>) -> Vec<String> {
+        build_action_items(&actions(), enabled, PLATFORM).into_iter().map(|item| item.key).collect()
+    }
+
+    #[test]
+    fn action_rows_keep_what_herdr_would_run_from_here() {
+        let mut enabled: Vec<String> = ["herdr-servers", "viewer", "herdr-bar", "herdr-swarm", "clipper", "untitled"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let expected = vec![
+            "action:herdr-servers.open",
+            "action:herdr-servers.doctor",
+            "action:herdr-bar.stop-titles",
+            "action:herdr-swarm.session",
+            "action:clipper.paste",
+        ];
+        assert_eq!(action_keys(Some(&enabled)), expected);
+        // Nothing to say which plugins are enabled: keep them all.
+        let mut all = expected.clone();
+        all.push("action:off.go");
+        assert_eq!(action_keys(None), all);
+        enabled.clear();
+        assert!(action_keys(Some(&enabled)).is_empty());
+    }
+
+    #[test]
+    fn an_action_row_names_its_action_and_plugin() {
+        let item = build_action_items(&actions(), None, PLATFORM).remove(0);
+        assert_eq!(item.kind, KIND_ACTION);
+        assert_eq!(item.title, "Open servers");
+        assert_eq!(item.detail, "Every dev server running");
+        assert_eq!(item.subtitle, "herdr-servers");
+        assert_eq!(item.plugin_action, Some(("herdr-servers".into(), "open".into())));
+        assert_eq!((item.tab_id.as_deref(), item.pane_id.as_deref()), (None, None));
+        assert!(item.fields.contains(&"herdr-servers.open".to_string()));
+        assert!(item.fields.contains(&"action".to_string()));
+    }
+
+    #[test]
+    fn session_rows_carry_no_action() {
+        assert!(items().iter().all(|item| item.plugin_action.is_none()));
+    }
+
+    #[test]
+    fn the_platform_is_one_herdr_names() {
+        assert!(["linux", "macos", "windows"].contains(&PLATFORM));
     }
 }

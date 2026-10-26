@@ -287,6 +287,7 @@ Whichever you pick, Cmd+K is likely already taken by the terminal (usually
 | `esc`, `ctrl+c`, `ctrl+g` | leave, change nothing |
 | `tab` / `shift+tab` | cycle the filter |
 | `@` `%` `$` `!` on an empty query | filter to agents / panes / plain tabs / rows that need you |
+| `>` on an empty query | filter to plugin actions, with `"actions": true` |
 | `backspace` on an empty query | clear the filter, then close the selected row's tab |
 | `delete` (fn+`⌫` on a Mac laptop) | close the selected row's tab, whatever is typed |
 | `ctrl+u` / `ctrl+w` / `ctrl+d` | clear the query and return to the opening filter / delete a word / forward delete |
@@ -303,6 +304,19 @@ and its pane; selecting a workspace focuses the workspace.
 list. Named panes also appear in Everything and participate in its searches;
 the pane filter narrows the list to just those direct pane targets. Selecting a
 pane focuses its tab and that exact pane.
+
+**Plugin actions.** With `"actions": true`, every plugin action you could bind
+a key to is a row too: its title, what it says it does, and the plugin it comes
+from. `>` narrows the list to them, and Enter runs the action instead of
+jumping, so one key can open the bar and from there any plugin. Actions come
+after everything else with no query and lose ties with places when you search,
+so Enter on a fresh bar still takes you somewhere. Left out: actions of
+disabled plugins and of other platforms (Herdr would refuse them), the bar's
+own `Open bar`, and actions offered only on a text selection, which the bar
+never has. The preview shows the action's qualified id, the name a keybinding
+uses. An action gets the same context as from a keybinding: the tab and pane
+you opened the bar from. Running one does not count as a visit, so the bar
+still offers you the place you came from first next time.
 
 **What a row says.** The tab's own name comes first — that is what you named
 the work and what you remember it by — and an agent's current summary follows it
@@ -371,8 +385,9 @@ Optional. Write `config.json` in the plugin config directory
 | `follow_new_sessions` | `false` | `true` lets the next Claude or Codex session in a pane take over the task title written for the one before it, after `/clear`, a restart or a new terminal; a tab you renamed stays yours |
 | `tab_status` | `false` | opt in to agent logos and status glyphs in tab names; `false` restores labels still owned by the watcher |
 | `running_time` | `true` | per-row running time (`47s`, `2h04m`); `false` hides it and skips the per-pane `process_info`/`ps` reading, so the bar opens faster |
-| `scope` | `"all"` | the filter the bar opens with: `"agent"` (`@ agents`), `"pane"` (`% panes`), `"tab"` (`$ shells`), `"blocked"` (`! needs you`) or `"all"`; `backspace` on an empty query still clears it, and `ctrl+u` returns to it |
+| `scope` | `"all"` | the filter the bar opens with: `"agent"` (`@ agents`), `"pane"` (`% panes`), `"tab"` (`$ shells`), `"blocked"` (`! needs you`), `"action"` (`> actions`, with `"actions": true`) or `"all"`; `backspace` on an empty query still clears it, and `ctrl+u` returns to it |
 | `select_current` | `false` | `true` opens with the row you are in selected instead of the one you came from; the order stays the same, so that row follows the recently visited ones |
+| `actions` | `false` | `true` lists plugin actions as rows that run on Enter; `>` filters to them. The list is read once per open |
 | `colors` | `{}` | role → `#rrggbb`, an ANSI name (`bright_blue`), or 0-255. Roles: `accent`, `match`, `text`, `muted`, `blocked`, `working`, `done`, `idle`, `unknown`, plus `agent_claude`, `agent_codex`, `agent_pi`, `agent_grok`, `agent_kimi`, `agent_gemini`, `agent_cursor`, `agent_opencode` |
 
 Colors default to plain ANSI, so the bar follows whatever theme your terminal
@@ -398,7 +413,11 @@ socket, or the named pipe herdr serves under the same path on Windows),
 re-reads it while it is open so statuses stay live, tails the selected pane with
 `pane.read` for the preview, and calls `tab.focus`, `pane.focus`, `agent.focus`,
 or `workspace.focus` when you press Enter, or `tab.close` when you confirm a
-delete. Running times come from `pane.process_info` plus `ps` (the process
+delete. With action rows on, it also reads `plugin.action.list` and
+`plugin.list` once per open, beside the first snapshot, and Enter on an action
+calls `plugin.action.invoke` and then `popup.close`: Herdr holds one popup at a
+time, and many actions open their own, so the bar's popup is gone before the
+action asks. Running times come from `pane.process_info` plus `ps` (the process
 creation time on Windows), one reading per
 pane on the way onto the screen and then ticked locally, because a start time
 never moves. If the socket is unavailable it falls back to the `herdr` CLI.

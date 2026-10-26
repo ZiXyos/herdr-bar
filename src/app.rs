@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::fuzzy::{match_prepared, split_query, Match, Term};
 use crate::fxhash::FxHashMap;
 use crate::icons;
-use crate::items::{build_items, build_pane_items, Item, KIND_AGENT, KIND_PANE, KIND_SPACE, KIND_TAB};
+use crate::items::{build_action_items, build_items, build_pane_items, Item, KIND_ACTION, KIND_AGENT, KIND_PANE, KIND_SPACE, KIND_TAB, PLATFORM};
 use crate::keys::{Event, KeyDecoder, MouseKind};
 use crate::mru::Recents;
 use crate::paint::Painter;
@@ -20,7 +20,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-pub const SCOPES: &[&str] = &["all", "agent", "pane", "tab", "blocked"];
+/// The filters, in `tab` order. "action" only exists with the action rows,
+/// so it stays last: without them, `tab` cycles through the rest.
+pub const SCOPES: &[&str] = &["all", "agent", "pane", "tab", "blocked", "action"];
 
 fn scope_sigil(text: &str) -> Option<&'static str> {
     Some(match text {
@@ -28,6 +30,7 @@ fn scope_sigil(text: &str) -> Option<&'static str> {
         "%" => "pane",
         "$" => "tab",
         "!" => "blocked",
+        ">" => "action",
         _ => return None,
     })
 }
@@ -39,6 +42,7 @@ fn scope_chip(scope: &str) -> &'static str {
         "pane" => "% panes",
         "tab" => "$ shells",
         "blocked" => "! needs you",
+        "action" => "> actions",
         _ => "",
     }
 }
@@ -51,6 +55,9 @@ pub const STATUS_TTL: f64 = 2.5;
 
 pub const PLACEHOLDER: &str = "jump to a tab, pane or agent…    @ agents   % panes   $ shells   ! needs you";
 pub const PLACEHOLDER_SHORT: &str = "jump to a tab, pane or agent…";
+pub const PLACEHOLDER_ACTIONS: &str =
+    "jump to a tab, pane or agent, or run an action…    @ agents   % panes   $ shells   ! needs you   > actions";
+pub const PLACEHOLDER_ACTIONS_SHORT: &str = "jump, or run an action…";
 
 /// time.monotonic(): seconds on a clock that only moves forward. It starts
 /// far from zero, as Python's does, so "never" (0.0) is long ago.
@@ -132,6 +139,10 @@ pub enum Outcome {
     Confirm,
 }
 
+/// How a match ranks: score, then places before actions, recency, status,
+/// and shorter titles first.
+type SortKey = (i64, bool, usize, i64, usize);
+
 /// The rows one snapshot makes, before the bar takes them in.
 pub struct Pool {
     workspace_count: usize,
@@ -165,9 +176,14 @@ pub struct Bar {
     pub config: Config,
     pub recents: Recents,
     pub theme: Theme,
-    /// Rows point into this: the tab and agent items, then the pane items.
+    /// Rows point into this: the tab and agent items, the pane items, then
+    /// the action items.
     pub pool: Vec<Item>,
     item_count: usize,
+    pane_end: usize,
+    /// The action rows, read once per run: plugins cannot change while the
+    /// popup owns the screen.
+    pub actions: Vec<Item>,
     pub rows: Vec<Row>,
     pub query: String,
     pub cursor: usize,
@@ -211,6 +227,8 @@ impl Bar {
             theme,
             pool: Vec::new(),
             item_count: 0,
+            pane_end: 0,
+            actions: Vec::new(),
             rows: Vec::new(),
             query: String::new(),
             cursor: 0,
@@ -247,7 +265,11 @@ impl Bar {
     }
 
     pub fn pane_items(&self) -> &[Item] {
-        &self.pool[self.item_count..]
+        &self.pool[self.item_count..self.pane_end]
+    }
+
+    pub fn action_items(&self) -> &[Item] {
+        &self.pool[self.pane_end..]
     }
 
     // -- data ---------------------------------------------------------------
@@ -309,7 +331,10 @@ impl Bar {
             }
         }
         self.item_count = pool.item_count;
-        let old = std::mem::replace(&mut self.pool, pool.items);
+        let mut items = pool.items;
+        self.pane_end = items.len();
+        items.extend(self.actions.iter().cloned());
+        let old = std::mem::replace(&mut self.pool, items);
         crate::par::drop_aside(old, self.pool.len() >= crate::par::MIN_PARALLEL);
         self.last_refresh = monotonic();
         self.rebuild(if force { None } else { keep });
@@ -337,13 +362,15 @@ impl Bar {
             "pane" => item.kind == KIND_PANE,
             "tab" => item.kind == KIND_TAB,
             "blocked" => item.status == "blocked" || item.status == "done",
+            "action" => item.kind == KIND_ACTION,
             _ => true,
         }
     }
 
     fn filter(&self) -> Vec<Row> {
         let source: Vec<usize> = match self.scope {
-            "pane" => (self.item_count..self.pool.len()).collect(),
+            "pane" => (self.item_count..self.pane_end).collect(),
+            "action" => (self.pane_end..self.pool.len()).collect(),
             "all" => (0..self.pool.len()).collect(),
             _ => (0..self.item_count).collect(),
         };
@@ -360,7 +387,7 @@ impl Bar {
         let (pool, recents) = (&self.pool, &self.recents);
         // Rows score independently, so a big list is scored in chunks (see
         // `par`); each chunk keeps its own memo, which only saves work.
-        let mut scored: Vec<((i64, usize, i64, usize), Row)> = crate::par::map_chunks(&candidates, |chunk| {
+        let mut scored: Vec<(SortKey, Row)> = crate::par::map_chunks(&candidates, |chunk| {
             let mut memo: Memo = Memo::default();
             let mut scored = Vec::new();
             for &index in chunk {
@@ -368,8 +395,9 @@ impl Bar {
                 let Some((score, by_field)) = score_item(&terms, item, &mut memo) else { continue };
                 let rank = recents.rank(&item.key, &item.title).unwrap_or(999);
                 let positions = by_field.get(&0).cloned().unwrap_or_default();
+                // On a tie the place beats the action: Enter should go somewhere.
                 scored.push((
-                    (-score, rank, item.status_rank(), char_len(&item.title)),
+                    (-score, item.kind == KIND_ACTION, rank, item.status_rank(), char_len(&item.title)),
                     Row { item: index, positions, field_positions: by_field },
                 ));
             }
@@ -401,12 +429,17 @@ impl Bar {
         recent.sort_by_key(|entry| entry.0);
         rest.sort_by(|&a, &b| {
             let (a, b) = (&self.pool[a], &self.pool[b]);
-            let key = |item: &Item| (item.kind == KIND_SPACE, item.status_rank());
-            key(a)
-                .cmp(&key(b))
-                .then_with(|| a.workspace_label.cmp(&b.workspace_label))
-                .then_with(|| a.tab_number.unwrap_or(1 << 30).cmp(&b.tab_number.unwrap_or(1 << 30)))
-                .then_with(|| a.title.cmp(&b.title))
+            let key = |item: &Item| (item.kind == KIND_ACTION, item.kind == KIND_SPACE, item.status_rank());
+            key(a).cmp(&key(b)).then_with(|| {
+                if a.kind == KIND_ACTION {
+                    // Last, in Herdr's order, which keeps each plugin's together.
+                    return std::cmp::Ordering::Equal;
+                }
+                a.workspace_label
+                    .cmp(&b.workspace_label)
+                    .then_with(|| a.tab_number.unwrap_or(1 << 30).cmp(&b.tab_number.unwrap_or(1 << 30)))
+                    .then_with(|| a.title.cmp(&b.title))
+            })
         });
         let mut ordered: Vec<usize> = recent.iter().map(|(_, item)| *item).collect();
         let recent_count = recent.len();
@@ -455,9 +488,19 @@ impl Bar {
         self.rebuild(None);
     }
 
+    /// The filters `tab` cycles through.
+    fn scopes(&self) -> &'static [&'static str] {
+        if self.config.actions {
+            SCOPES
+        } else {
+            &SCOPES[..SCOPES.len() - 1]
+        }
+    }
+
     fn cycle_scope(&mut self, step: isize) {
-        let index = SCOPES.iter().position(|s| *s == self.scope).unwrap_or(0) as isize;
-        self.scope = SCOPES[(index + step).rem_euclid(SCOPES.len() as isize) as usize];
+        let scopes = self.scopes();
+        let index = scopes.iter().position(|s| *s == self.scope).unwrap_or(0) as isize;
+        self.scope = scopes[(index + step).rem_euclid(scopes.len() as isize) as usize];
         self.selected = 0;
         self.rebuild(None);
     }
@@ -471,7 +514,7 @@ impl Bar {
             return;
         }
         if self.query.is_empty() && char_len(&text) == 1 {
-            if let Some(scope) = scope_sigil(&text) {
+            if let Some(scope) = scope_sigil(&text).filter(|scope| self.scopes().contains(scope)) {
                 // A leading sigil is a filter, not a character: "@" scopes the
                 // list to agents instead of searching for a literal at sign.
                 self.scope = scope;
@@ -923,7 +966,12 @@ impl Bar {
 
         let mut rows: Vec<String> = Vec::new();
         let chip = scope_chip(self.scope);
-        let placeholder = if layout.inner_width >= 62 { PLACEHOLDER } else { PLACEHOLDER_SHORT };
+        let placeholder = match (self.config.actions, layout.inner_width >= 62) {
+            (false, true) => PLACEHOLDER,
+            (false, false) => PLACEHOLDER_SHORT,
+            (true, true) => PLACEHOLDER_ACTIONS,
+            (true, false) => PLACEHOLDER_ACTIONS_SHORT,
+        };
         if let Some((_, old_title)) = &self.pending_rename {
             rows.push(format!(
                 " {}",
@@ -1055,9 +1103,10 @@ impl Bar {
             return render::render_footer(&self.theme, width, &[("⏎", "save"), ("esc", "keep"), ("^u", "clear")], "renaming");
         }
         let close_key = if self.backspace_closes() { "⌫" } else { "⌦" };
+        let runs = !self.rows.is_empty() && self.selected_item().kind == KIND_ACTION;
         let mut hints: Vec<(&str, &str)> = vec![
             ("↑↓", "move"),
-            ("⏎", "jump"),
+            ("⏎", if runs { "run" } else { "jump" }),
             ("⇥", "scope"),
             // Backspace only reaches the close once there is nothing left for
             // it to erase, so the footer names whichever key works right now.
@@ -1071,6 +1120,7 @@ impl Bar {
         }
         let total = match self.scope {
             "pane" => self.pane_items().len(),
+            "action" => self.action_items().len(),
             "all" => self.pool.len(),
             _ => self.items().len(),
         };
@@ -1194,6 +1244,43 @@ impl Bar {
     }
 }
 
+/// The action rows for this platform, or none when Herdr cannot list them:
+/// the session rows still work, so a failure is not worth a message.
+pub fn load_actions(client: &mut HerdrClient) -> Vec<Item> {
+    let Ok(actions) = client.plugin_actions() else { return Vec::new() };
+    // Actions of a disabled plugin are listed but refused.
+    let enabled: Option<Vec<String>> = crate::renaming_guard::installed_plugins(client).ok().map(|plugins| {
+        plugins
+            .iter()
+            .filter(|plugin| plugin.get("enabled").map(|v| v.truthy()).unwrap_or(false))
+            .filter_map(|plugin| plugin.get("plugin_id").and_then(|v| v.as_str()).map(String::from))
+            .collect()
+    });
+    build_action_items(&actions, enabled.as_deref(), PLATFORM)
+}
+
+/// Whether the bar runs in Herdr's popup, which exports no pane id.
+pub fn in_popup() -> bool {
+    let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+    set("HERDR_PLUGIN_ENTRYPOINT_ID") && !set("HERDR_PANE_ID")
+}
+
+/// Run an action row's action, then get out of its way.
+///
+/// Herdr holds one popup at a time and refuses a second, and many actions
+/// open one. The bar's own popup would otherwise close only once Herdr sees
+/// the process exit, so it is closed here, right after the invoke, well
+/// before the action's command has started and asked for its own.
+pub fn run_action(client: &mut HerdrClient, item: &Item, popup: bool) -> Result<()> {
+    let Some((plugin_id, action_id)) = &item.plugin_action else { return Ok(()) };
+    client.invoke_action(plugin_id, action_id)?;
+    if popup {
+        // Closing the popup ends this process; a failure leaves the exit to do it.
+        let _ = client.close_popup();
+    }
+    Ok(())
+}
+
 /// Focus whatever the row points at.
 pub fn jump(client: &mut HerdrClient, item: &Item) -> Result<()> {
     if item.kind == KIND_SPACE {
@@ -1314,6 +1401,22 @@ mod tests {
 
     // -- a fake Herdr ---------------------------------------------------------
 
+    #[cfg(unix)]
+    const PLUGIN_ACTIONS: &str = r#"[
+        {"plugin_id": "herdr-servers", "action_id": "open", "title": "Open servers", "description": "Every dev server running"},
+        {"plugin_id": "herdr-servers", "action_id": "broken", "title": "Broken servers"},
+        {"plugin_id": "herdr-servers", "action_id": "week", "title": "Weekly digest"},
+        {"plugin_id": "herdr-stats", "action_id": "open", "title": "Open stats"},
+        {"plugin_id": "herdr-bar", "action_id": "open", "title": "Open bar"}
+    ]"#;
+
+    #[cfg(unix)]
+    const PLUGINS: &str = r#"[
+        {"plugin_id": "herdr-servers", "enabled": true},
+        {"plugin_id": "herdr-stats", "enabled": false},
+        {"plugin_id": "herdr-bar", "enabled": true}
+    ]"#;
+
     /// What the Python tests' FakeClient held.
     #[cfg(unix)]
     struct State {
@@ -1421,6 +1524,20 @@ mod tests {
             "tab.focus" => state.calls.push(vec!["tab".into(), s(&params, "tab_id")]),
             "agent.focus" => state.calls.push(vec!["agent".into(), s(&params, "target")]),
             "pane.focus" => state.calls.push(vec!["pane".into(), s(&params, "pane_id")]),
+            "plugin.action.list" => {
+                result.insert("actions", pyjson::loads(PLUGIN_ACTIONS).unwrap());
+            }
+            "plugin.list" => {
+                result.insert("plugins", pyjson::loads(PLUGINS).unwrap());
+            }
+            "plugin.action.invoke" => {
+                let action = s(&params, "action_id");
+                state.calls.push(vec!["invoke".into(), s(&params, "plugin_id"), action.clone()]);
+                if action == "broken" {
+                    return err("plugin action not found");
+                }
+            }
+            "popup.close" => state.calls.push(vec!["popup".into()]),
             _ => return err("unknown method"),
         }
         ok(result)
@@ -1519,6 +1636,26 @@ mod tests {
     #[cfg(unix)]
     fn bar() -> T {
         bar_with(testutil::snapshot(), Config::default(), Recents::new(None))
+    }
+
+    /// `bar()` with `"actions": true`, loading them the way the CLI does.
+    #[cfg(unix)]
+    fn action_bar() -> T {
+        let env = testutil::env_lock();
+        let fake = Fake::new(testutil::snapshot());
+        let mut client = fake.client();
+        let config = config_of(&[("actions", Value::Bool(true))]);
+        let actions = load_actions(&mut client);
+        let pool = client.snapshot().map(|snapshot| Pool::build(&snapshot, &config));
+        let mut bar = Bar::new(client, config, Recents::new(None), Theme::new(None, None, None));
+        bar.actions = actions;
+        bar.bootstrap(pool, Vec::new()).expect("bootstrap");
+        T { bar, fake, _env: env }
+    }
+
+    #[cfg(unix)]
+    fn kinds(bar: &Bar) -> Vec<&'static str> {
+        bar.rows.iter().map(|row| bar.pool[row.item].kind).collect()
     }
 
     #[cfg(unix)]
@@ -1940,6 +2077,173 @@ mod tests {
         let mut t = mouse_bar();
         assert_eq!(name(t.bar.handle_mouse(MouseKind::Press, 1)), None);
         assert_eq!(t.bar.selected, 0);
+    }
+
+    // -- plugin actions ---------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn actions_stay_out_unless_asked_for() {
+        let t = bar();
+        assert!(t.bar.action_items().is_empty());
+        assert!(!kinds(&t.bar).contains(&KIND_ACTION));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn action_rows_skip_disabled_plugins_and_the_bar_itself() {
+        let t = action_bar();
+        let keys: Vec<&str> = t.bar.action_items().iter().map(|item| item.key.as_str()).collect();
+        assert_eq!(keys, vec!["action:herdr-servers.open", "action:herdr-servers.broken", "action:herdr-servers.week"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn at_rest_actions_come_last_in_herdrs_order() {
+        let t = action_bar();
+        let sessions = t.bar.items().len() + t.bar.pane_items().len();
+        assert_eq!(t.bar.rows.len(), sessions + 3);
+        assert!(kinds(&t.bar)[..sessions].iter().all(|kind| *kind != KIND_ACTION));
+        assert_eq!(titles(&t.bar)[sessions..], ["Open servers", "Broken servers", "Weekly digest"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn actions_survive_a_refresh() {
+        let mut t = action_bar();
+        t.fake.set(|s| {
+            if let Some(Value::List(agents)) = s.snapshot.as_dict_mut().unwrap().get_mut("agents") {
+                agents.truncate(1);
+            }
+        });
+        t.bar.refresh(false);
+        assert_eq!(t.bar.action_items().len(), 3);
+        assert_eq!(t.bar.pane_items().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_finds_actions_by_title_description_and_id() {
+        let mut t = action_bar();
+        t.bar.set_query("open servers".into(), None);
+        assert_eq!(titles(&t.bar)[0], "Open servers");
+        t.bar.set_query("every dev".into(), None);
+        assert_eq!(titles(&t.bar)[0], "Open servers");
+        t.bar.set_query("servers.broken".into(), None);
+        assert_eq!(titles(&t.bar), vec!["Broken servers"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_a_tie_the_place_wins_over_the_action() {
+        let mut t = action_bar();
+        // A plain tab's status ("none") ranks below an action's, so only the
+        // kind can put the tab first.
+        let tab = t.bar.items().iter().find(|item| item.kind == KIND_TAB && item.status == "none").expect("plain tab");
+        let title = tab.title.clone();
+        let json = format!(r#"[{{"plugin_id": "p", "action_id": "a", "title": {}}}]"#, pyjson::dumps(&Value::str(title.clone()), false));
+        t.bar.actions = build_action_items(pyjson::loads(&json).unwrap().list_or_empty(), None, PLATFORM);
+        t.bar.refresh(true);
+        t.bar.set_query(title.clone(), None);
+        let same: Vec<&str> =
+            t.bar.rows.iter().map(|row| &t.bar.pool[row.item]).filter(|item| item.title == title).map(|item| item.kind).collect();
+        assert_eq!(same, vec![KIND_TAB, KIND_ACTION]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_action_sigil_filters_to_actions() {
+        let mut t = action_bar();
+        t.bar.insert(">", false);
+        assert_eq!(t.bar.scope, "action");
+        assert_eq!(t.bar.query, "");
+        assert_eq!(kinds(&t.bar), vec![KIND_ACTION; 3]);
+        t.bar.handle_key("backspace");
+        assert_eq!(t.bar.scope, "all");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_actions_the_sigil_is_literal_and_tab_skips_the_filter() {
+        let mut t = bar();
+        t.bar.insert(">", false);
+        assert_eq!((t.bar.scope, t.bar.query.as_str()), ("all", ">"));
+        t.bar.set_query(String::new(), None);
+        let mut seen = Vec::new();
+        // One press per filter there is, which brings it back to "all".
+        for _ in 0..SCOPES.len() - 1 {
+            t.bar.handle_key("tab");
+            seen.push(t.bar.scope);
+        }
+        assert!(!seen.contains(&"action"), "{:?}", seen);
+        assert_eq!(seen.last(), Some(&"all"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn with_actions_tab_reaches_the_action_filter() {
+        let mut t = action_bar();
+        t.bar.handle_key("shift+tab");
+        assert_eq!(t.bar.scope, "action");
+        assert_eq!(t.bar.rows.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_an_action_invokes_it_then_closes_the_popup() {
+        let mut t = action_bar();
+        t.fake.clear_calls();
+        t.bar.insert(">", false);
+        let item = t.bar.selected_item().clone();
+        run_action(&mut t.bar.client, &item, true).unwrap();
+        assert_eq!(t.fake.all_calls(), vec![call(&["invoke", "herdr-servers", "open"]), call(&["popup"])]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outside_a_popup_the_action_runs_and_nothing_closes() {
+        let mut t = action_bar();
+        t.fake.clear_calls();
+        t.bar.insert(">", false);
+        let item = t.bar.selected_item().clone();
+        run_action(&mut t.bar.client, &item, false).unwrap();
+        assert_eq!(t.fake.all_calls(), vec![call(&["invoke", "herdr-servers", "open"])]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_action_reports_and_leaves_the_popup_alone() {
+        let mut t = action_bar();
+        t.fake.clear_calls();
+        t.bar.set_query("servers.broken".into(), None);
+        let item = t.bar.selected_item().clone();
+        let error = run_action(&mut t.bar.client, &item, true).unwrap_err();
+        assert!(error.message.contains("not found"), "{}", error);
+        assert_eq!(t.fake.all_calls(), vec![call(&["invoke", "herdr-servers", "broken"])]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn action_rows_cannot_be_closed_or_renamed() {
+        let mut t = action_bar();
+        t.bar.insert(">", false);
+        t.bar.handle_key("delete");
+        assert!(t.bar.pending_close.is_none());
+        t.bar.handle_key("ctrl+r");
+        assert!(t.bar.pending_rename.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_popup_is_the_one_without_a_pane_id() {
+        let _env = testutil::env_lock();
+        let mut vars = testutil::EnvVars::new();
+        vars.set("HERDR_PLUGIN_ENTRYPOINT_ID", "bar").remove("HERDR_PANE_ID");
+        assert!(in_popup());
+        vars.set("HERDR_PANE_ID", "w1:p3");
+        assert!(!in_popup());
+        vars.remove("HERDR_PLUGIN_ENTRYPOINT_ID").remove("HERDR_PANE_ID");
+        assert!(!in_popup());
     }
 
     // -- RefreshTest ------------------------------------------------------------
@@ -2639,5 +2943,41 @@ mod tests {
         assert!(footer.contains("close"));
         assert!(footer.contains(&title));
         assert!(!footer.contains("scope"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_action_row_reads_as_one_and_enter_says_run() {
+        let mut t = action_bar();
+        t.bar.theme = Theme::new(None, Some(&Value::str("237")), None);
+        t.bar.insert(">", false);
+        let rows = t.bar.compose(140, 20);
+        let plain = joined(&rows);
+        assert!(plain.contains("> actions"), "{}", plain);
+        let row = plain.lines().find(|line| line.contains("Open servers")).expect("action row");
+        assert!(row.contains("›"), "{}", row);
+        assert!(row.contains("herdr-servers"), "{}", row);
+        assert!(row.contains("action"), "{}", row);
+        // The preview: the id a keybinding would use, then the description.
+        assert!(plain.contains("herdr-servers.open"), "{}", plain);
+        assert!(plain.contains("Every dev server running"), "{}", plain);
+        let footer = crate::textutil::strip_ansi(rows.last().unwrap());
+        assert!(footer.contains("⏎ run"), "{:?}", footer);
+        t.bar.insert("x", false);
+        t.bar.handle_key("backspace");
+        t.bar.handle_key("backspace");
+        let footer = crate::textutil::strip_ansi(t.bar.compose(140, 20).last().unwrap());
+        assert!(footer.contains("⏎ jump"), "{:?}", footer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_placeholder_mentions_actions_only_when_they_are_on() {
+        let without = joined(&draw(140, 20, "").rows);
+        assert!(!without.contains("> actions"), "{}", without);
+        let mut t = action_bar();
+        let with = joined(&t.bar.compose(140, 20));
+        assert!(with.contains("run an action"), "{}", with);
+        assert!(with.contains("> actions"), "{}", with);
     }
 }
