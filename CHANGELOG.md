@@ -1,12 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.13.0
 
-- Add Pi as an `auto_titles` source. Pi prints `<app> - <folder>` until `/name`
-  names the session, and `<app> - <name> - <folder>` after that, so the name is
-  read from the terminal title Herdr already reports and no transcript is
-  opened. The session file path Pi's integration reports (`kind: "path"`, an
-  absolute `.jsonl`) is the identity that keeps an owned name tied to one
+- Add Pi as an `auto_titles` source (#25). Pi prints `<app> - <folder>` until
+  `/name` names the session, and `<app> - <name> - <folder>` after that, so the
+  name is read from the terminal title Herdr already reports and no transcript
+  is opened. The session file path Pi's integration reports (`kind: "path"`,
+  an absolute `.jsonl`) is the identity that keeps an owned name tied to one
   session.
 
 ## 0.12.0
